@@ -11,7 +11,7 @@ const rateLimit = require('express-rate-limit');
 const connectDB = require('./config/db');
 const seedDevices = require('./scripts/seedDevices');
 const logger = require('./utils/logger');
-const wanwayPoller = require('./services/wanway.poller'); // Added Poller
+const wanwayPoller = require('./services/wanway.poller');
 
 // ── Firebase Admin ─────────────────────────────────────────────────────────────
 try {
@@ -38,7 +38,7 @@ async function boot() {
   // 1. Database Connection
   await connectDB();
   
-  // 2. Data Integrity: Seed devices in Dev or if needed
+  // 2. Seed devices in Dev only
   if (process.env.NODE_ENV !== 'production') {
     await seedDevices();
   }
@@ -46,33 +46,30 @@ async function boot() {
   const app = express();
   const server = http.createServer(app);
 
-  // 3. Socket.IO: Tuned for high-frequency tracking updates
+  // 3. Socket.IO
   const io = socketIo(server, {
     cors: { origin: '*', methods: ['GET', 'POST'] },
     transports: ['websocket'], 
-    pingInterval: 10000, // Frequent pings to clear dead mobile connections
+    pingInterval: 10000,
     pingTimeout: 5000,
     bufferSize: 1e6 
   });
   
   global.io = io;
 
-  // ── Middleware ─────────────────────────────────────────────────────────────
+  // ── Middleware ──────────────────────────────────────────────────────────────
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors({ origin: true, credentials: true }));
-  // Morgan logs piped into Winston
   app.use(morgan('combined', { stream: { write: msg => logger.info(msg.trim()) } }));
   app.use(express.json({ limit: '2mb' }));
 
-  const apiLimiter = rateLimit({
+  app.use('/api/', rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 2000, // Balanced for heavy dashboard usage
+    max: 2000,
     standardHeaders: true,
-  });
+  }));
 
-  app.use('/api/', apiLimiter);
-
-  // ── Routes ─────────────────────────────────────────────────────────────────
+  // ── Routes ──────────────────────────────────────────────────────────────────
   app.use('/api/auth',      require('./routes/auth.routes'));
   app.use('/api/vehicles',  require('./routes/vehicles.routes'));
   app.use('/api/tracking',  require('./routes/tracking.routes'));
@@ -80,11 +77,10 @@ async function boot() {
   app.use('/api/analytics', require('./routes/analytics.routes'));
   app.use('/api/geofences', require('./routes/geofence.routes'));
 
-  // ── Socket Connection Logic ────────────────────────────────────────────────
+  // ── Socket Connection Logic ─────────────────────────────────────────────────
   io.on('connection', (socket) => {
     logger.info('🔌 User connected: %s', socket.id);
 
-    // Dynamic Room Joining (By User ID or Company ID)
     socket.on('join_fleet', (fleetId) => {
       socket.join(fleetId);
       logger.info('User %s monitoring fleet: %s', socket.id, fleetId);
@@ -93,25 +89,24 @@ async function boot() {
     socket.on('disconnect', () => logger.info('❌ User disconnected: %s', socket.id));
   });
 
-  // ── Start Background Services ──────────────────────────────────────────────
-  
-  // A. Start TCP GPS Server (GT06/Hardware)
+  // ── Background Services ─────────────────────────────────────────────────────
+
+  // A. TCP GPS Server (GT06/Hardware devices)
   const GPS_PORT = process.env.GPS_TCP_PORT || 5001;
   require('./services/gps.server').startGpsServer(GPS_PORT);
+  // ↑ This already logs "📡 GPS TCP Receiver online on port 5001" internally
 
-  // B. Start WanWay Cloud Poller (API Sync)
-  // We only start this after the DB and Socket are ready
+  // B. WanWay Cloud Poller
   wanwayPoller.start();
 
-  // ── Launch ─────────────────────────────────────────────────────────────────
+  // ── Launch HTTP Server ──────────────────────────────────────────────────────
   const PORT = process.env.PORT || 5000;
   server.listen(PORT, '0.0.0.0', () => {
     logger.info('🚀 NVIQ Fleet Server online on port %d', PORT);
-    logger.info('📡 GPS TCP Receiver online on port %d', GPS_PORT);
+    // ✅ REMOVED: duplicate GPS TCP log that was here before
   });
 }
 
-// Error Handling for the Boot Sequence
 boot().catch(err => {
   logger.error('❌ Boot Sequence Failed: %s', err.stack);
   process.exit(1);

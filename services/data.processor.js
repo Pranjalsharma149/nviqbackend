@@ -36,12 +36,16 @@ async function processBulkUpdates(deviceArray) {
           ? new Date(dev.signalTime * 1000)
           : now;
 
-      // ✅ IOPGPS sends lat/lng as STRINGS, not latitude/longitude as numbers
+      // ✅ IOPGPS sends lat/lng as STRINGS — parse first
       const lat = dev.lat != null ? parseFloat(dev.lat) : null;
       const lng = dev.lng != null ? parseFloat(dev.lng) : null;
+      // ✅ NO coordinate conversion — IOP GPS returns WGS-84 for Indian devices.
+      //    GCJ-02 conversion was incorrectly shifting the location by 400+ km.
 
-      // ✅ IOPGPS uses accStatus (boolean) not online (integer)
-      const isOnline = dev.online === 1 || dev.accStatus === true;
+      // ✅ Online = signalTime received within last 5 minutes
+      //    accStatus is ignition (on/off), NOT connectivity — do not use it for isOnline
+      const fiveMinutesAgo = (Date.now() / 1000) - 300;
+      const isOnline = dev.signalTime != null && dev.signalTime >= fiveMinutesAgo;
 
       // ✅ Valid GPS = parsed floats, not NaN, not 0,0
       const hasValidGPS =
@@ -85,7 +89,7 @@ async function processBulkUpdates(deviceArray) {
           speed:     dev.speed  ?? 0,
           heading:   dev.course ?? 0,
           altitude:  dev.altitude ?? 0,
-          // ✅ extVoltage comes as integer e.g. 129 = 12.9V
+          // ✅ extVoltage comes as integer e.g. 130 = 13.0V
           voltage:   dev.extVoltage != null ? dev.extVoltage / 10 : null,
           odometer:  dev.odometer   ?? null,
           timestamp,
@@ -107,7 +111,7 @@ async function processBulkUpdates(deviceArray) {
       });
 
       // ── Location ping (trip history) ──────────────────────────────────────
-      // Only record when moving + online + valid GPS
+      // Records when moving + online + valid GPS
       if (isOnline && hasValidGPS && (dev.speed ?? 0) > 0) {
         pingOps.push({
           vehicleId: vId,
@@ -120,7 +124,7 @@ async function processBulkUpdates(deviceArray) {
       }
     }
 
-    // ── Commit to MongoDB ──────────────────────────────────────────────────
+    // ── Commit to MongoDB ─────────────────────────────────────────────────
     await Promise.all([
       vehicleOps.length > 0
         ? Vehicle.bulkWrite(vehicleOps, { ordered: false })

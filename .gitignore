@@ -4,3 +4,6 @@ dist/
 build/     
 config/serviceAccountKey.json.json  
 config/firebase-service-account.json
+# Ignore all log files
+*.log
+logs/
