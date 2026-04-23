@@ -169,3 +169,35 @@ exports.createTestAlert = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/alerts/purge-old  (admin only)
+// ─────────────────────────────────────────────────────────────────────────────
+exports.purgeOldAlerts = async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only admins can purge alerts',
+      });
+    }
+
+    // Example: delete alerts older than 30 days
+    const cutoffDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const result = await Alert.deleteMany({
+      timestamp: { $lt: cutoffDate },
+    });
+
+    res.json({
+      success: true,
+      message: `${result.deletedCount} old alerts deleted`,
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};

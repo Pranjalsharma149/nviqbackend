@@ -1,102 +1,97 @@
-// config/devices.js
-//
-// ══════════════════════════════════════════════════════════════════════════════
-// SINGLE SOURCE OF TRUTH FOR ALL GPS DEVICES
-// ══════════════════════════════════════════════════════════════════════════════
-//
-// HOW TO ADD A NEW DEVICE (5 seconds):
-//   1. Get IMEI from device label or SMS *#06# to device SIM
-//   2. Add entry below in REGISTERED_DEVICES array
-//   3. Restart server — vehicle auto-creates in MongoDB
-//   4. Configure device via SMS (see bottom of file)
-//
-// HOW IT WORKS:
-//   PT06 device powers on → connects TCP to YOUR_IP:5001
-//   → Sends IMEI in login packet
-//   → Server looks up IMEI here → finds vehicle config
-//   → Auto-creates Vehicle in MongoDB if new
-//   → Device sends GPS every 10s → server emits to Flutter via Socket.IO
-//   → Your car marker moves on map in real time
-//
 'use strict';
 
+/**
+ * REGISTERED_DEVICES
+ * Single Source of Truth for fleet configuration.
+ * * Scalability Note: While this array works great for hundreds of devices,
+ * for 20k+ devices, you will eventually want to move this registry
+ * entirely into a MongoDB collection with an Index on IMEI.
+ */
 const REGISTERED_DEVICES = [
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // YOUR REAL PT06 DEVICE
-  // ══════════════════════════════════════════════════════════════════════════
   {
-    imei:        '356218606576971',   // ← your actual device IMEI
-    vehicleReg:  'UP80AB1234',        // ← change to your actual plate number
-    name:        'My Car (PT06)',     // ← change to your car name
-    type:        'car',               // car | truck | bike | auto | bus | van | ambulance | tractor
-    protocol:    'GT06',              // PT06 uses GT06 binary protocol
-    pocName:     'Driver Name',       // ← change to actual driver
-    pocContact:  '+919999999999',     // ← change to actual contact
-    speedLimit:  80,                  // km/h — alert fires above this
-    fuelAlert:   15,                  // % — alert fires below this
-    battAlert:   20,                  // % — alert fires below this
+    imei:         '356218606576971',   // Primary Key — Vehicle Tracker 1 (PT06)
+    vehicleReg:   'HR26AB1234',
+    name:         'Vehicle Tracker 1',
+    type:         'car',               // Used for Flutter map icons
+    protocol:     'PT06',              // ← Updated from GT06 to PT06 (confirmed from IOP GPS portal)
+    pocName:      'John Doe',
+    pocContact:   '+919999999999',
+    speedLimit:   80,                  // Engine triggers alert > 80 km/h
+    fuelAlert:    15,                  // Alert when fuel < 15%
+    battAlert:    20,                  // Alert when battery < 20%
   },
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // ADD MORE DEVICES HERE — one block per device
-  // Works for 2G / 3G / 4G variants — all use same GT06 binary protocol
-  // ══════════════════════════════════════════════════════════════════════════
-
-  // {
-  //   imei:       '123456789012345',
-  //   vehicleReg: 'DL1AB2345',
-  //   name:       'Truck 1',
-  //   type:       'truck',
-  //   protocol:   'GT06',
-  //   pocName:    'Ramesh Kumar',
-  //   pocContact: '+919876543210',
-  //   speedLimit: 60,
-  // },
-
-  // {
-  //   imei:       '987654321098765',
-  //   vehicleReg: 'MH02CD5678',
-  //   name:       'Bike 1',
-  //   type:       'bike',
-  //   protocol:   'GT06',
-  //   pocName:    'Suresh Pal',
-  //   pocContact: '+918765432109',
-  //   speedLimit: 50,
-  // },
-
+  // Add more devices below...
 ];
 
-// ── Fast lookup maps (built at startup, O(1) reads) ───────────────────────────
-const BY_IMEI = new Map(REGISTERED_DEVICES.map(d => [d.imei, d]));
-const BY_REG  = new Map(REGISTERED_DEVICES.map(d => [d.vehicleReg, d]));
+// ── OPTIMIZED LOOKUPS ────────────────────────────────────────────────────────
+// Using Maps ensures O(1) lookup time even as the list grows to thousands.
+const BY_IMEI = new Map();
+const BY_REG  = new Map();
+
+// Initialize maps once at startup
+REGISTERED_DEVICES.forEach(device => {
+  if (device.imei)       BY_IMEI.set(String(device.imei), device);
+  if (device.vehicleReg) BY_REG.set(String(device.vehicleReg), device);
+});
 
 module.exports = {
   REGISTERED_DEVICES,
-  getByIMEI:   imei => BY_IMEI.get(imei) || null,
-  getByReg:    reg  => BY_REG.get(reg)   || null,
-  getAllIMEIs:  ()   => REGISTERED_DEVICES.map(d => d.imei),
+
+  /**
+   * getByIMEI
+   * Used by GPS TCP server to identify incoming packets
+   */
+  getByIMEI: (imei) => {
+    if (!imei) return null;
+    return BY_IMEI.get(String(imei)) || null;
+  },
+
+  /**
+   * getByReg
+   * Used by API to find vehicle by plate number
+   */
+  getByReg: (reg) => {
+    if (!reg) return null;
+    return BY_REG.get(String(reg)) || null;
+  },
+
+  /**
+   * isKnownDevice
+   * Quick boolean check to drop unauthorized traffic early
+   */
+  isKnownDevice: (imei) => BY_IMEI.has(String(imei)),
+
+  getAllIMEIs: () => Array.from(BY_IMEI.keys()),
 };
 
-// ══════════════════════════════════════════════════════════════════════════════
-// PT06 DEVICE CONFIGURATION (send these SMS to device SIM)
-// ══════════════════════════════════════════════════════════════════════════════
-//
-// Step 1 — Set your server IP and port:
-//   IP[YOUR_SERVER_PUBLIC_IP],5001#
-//   Example: IP123.456.78.90,5001#
-//
-// Step 2 — Set mobile data APN (ask your SIM carrier):
-//   APNNAME[carrier_apn]#
-//   Airtel:  APNNAME airtelgprs.com#
-//   Jio:     APNNAME jionet#
-//   BSNL:    APNNAME bsnlnet#
-//   Vodafone:APNNAME www#
-//
-// Step 3 — Set GPS update interval (10 seconds):
-//   TIMER10#
-//
-// Step 4 — Check device status:
-//   STATUS#
-//   (Device replies with IP, signal, GPS status)
-//
+/**
+ * 💡 OPERATIONAL NOTES (PT06)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * To configure the physical PT06 tracker, send SMS commands to the SIM number
+ * inside the device (9876543210):
+ *
+ * 1. SET SERVER IP & PORT:
+ *    SMS: "SERVER,0,[YOUR_PUBLIC_IP],5001,0#"
+ *    Example: "SERVER,0,171.61.17.205,5001,0#"
+ *
+ * 2. SET APN (use your SIM provider's APN):
+ *    SMS: "APN,[APN_NAME]#"
+ *    Example for Jio: "APN,jionet#"
+ *    Example for Airtel: "APN,airtelgprs.com#"
+ *
+ * 3. SET REPORTING INTERVAL:
+ *    SMS: "TIMER,10,60#"  (10s when moving, 60s when stationary)
+ *
+ * 4. SET TIMEZONE TO UTC:
+ *    SMS: "GMT,E,0,0#"
+ *
+ * 5. CHECK STATUS:
+ *    SMS: "STATUS#"  — device replies with current config
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * IMPORTANT: Your server must be publicly accessible on port 5001.
+ * If running locally, use a tool like ngrok:
+ *   ngrok tcp 5001
+ * Then use the ngrok IP/port in the SERVER SMS command above.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */

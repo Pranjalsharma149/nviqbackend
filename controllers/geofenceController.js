@@ -1,199 +1,224 @@
-// controllers/geofenceController.js
 'use strict';
 
 const Geofence = require('../models/Geofence');
 const Vehicle  = require('../models/Vehicle');
 const Alert    = require('../models/Alert');
 const geolib   = require('geolib');
+const logger   = require('../utils/logger');
 
-// ── In-memory geofence cache — rebuilt on every create/update/delete ──────────
+// ── CACHE LAYER ─────────────────────────────────────────────────────────────
+// For 20k scale, we avoid hitting the DB for geofence rules on every GPS ping.
 let _geofenceCache = [];
 let _cacheValid    = false;
 
 async function getActiveGeofences() {
   if (_cacheValid) return _geofenceCache;
-  _geofenceCache = await Geofence.find({ isActive: true }).lean();
-  _cacheValid    = true;
-  return _geofenceCache;
+  try {
+    _geofenceCache = await Geofence.find({ isActive: true }).lean();
+    _cacheValid = true;
+    return _geofenceCache;
+  } catch (err) {
+    logger.error('❌ Geofence Cache Load Error: %s', err.message);
+    return [];
+  }
 }
 
-function invalidateCache() { _cacheValid = false; }
+function invalidateCache() { 
+  _cacheValid = false; 
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/geofences
-// ─────────────────────────────────────────────────────────────────────────────
+// ── STANDARD CRUD ───────────────────────────────────────────────────────────
+
 exports.getGeofences = async (req, res) => {
   try {
-    const geofences = await Geofence.find().sort({ createdAt: -1 }).lean();
-    res.json({ success: true, count: geofences.length, data: geofences.map(g => ({ ...g, id: g._id.toString() })) });
+    const fences = await Geofence.find().sort({ createdAt: -1 }).lean();
+    res.json({ success: true, count: fences.length, data: fences });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/geofences/:id
-// ─────────────────────────────────────────────────────────────────────────────
-exports.getGeofenceById = async (req, res) => {
-  try {
-    const g = await Geofence.findById(req.params.id).lean();
-    if (!g) return res.status(404).json({ success: false, message: 'Geofence not found' });
-    res.json({ success: true, data: { ...g, id: g._id.toString() } });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/geofences
-// Body: { name, description, geometry: { type:'Circle'|'Polygon', center:{lat,lng}, radius } | { type:'Polygon', coordinates:[[lat,lng]...] }, vehicleIds, alertOnEntry, alertOnExit }
-// ─────────────────────────────────────────────────────────────────────────────
 exports.createGeofence = async (req, res) => {
   try {
-    const { name, description, geometry, vehicleIds, alertOnEntry, alertOnExit } = req.body;
-
-    if (!name) return res.status(400).json({ success: false, message: 'name is required' });
-    if (!geometry?.type) return res.status(400).json({ success: false, message: 'geometry.type is required' });
-
-    if (geometry.type === 'Circle') {
-      if (!geometry.center?.latitude || !geometry.center?.longitude || !geometry.radius) {
-        return res.status(400).json({ success: false, message: 'Circle geofence requires center.latitude, center.longitude, radius' });
-      }
-    } else if (geometry.type === 'Polygon') {
-      if (!Array.isArray(geometry.coordinates) || geometry.coordinates.length < 3) {
-        return res.status(400).json({ success: false, message: 'Polygon geofence requires at least 3 coordinate points' });
-      }
-    } else {
-      return res.status(400).json({ success: false, message: 'geometry.type must be Circle or Polygon' });
-    }
-
-    const geofence = await Geofence.create({
-      name, description,
-      geometry,
-      vehicleIds:   vehicleIds  || [],
-      alertOnEntry: alertOnEntry ?? true,
-      alertOnExit:  alertOnExit  ?? true,
-      isActive:     true,
-      createdBy:    req.user._id,
-    });
-
+    const fence = await Geofence.create(req.body);
     invalidateCache();
-
-    res.status(201).json({ success: true, message: 'Geofence created', data: { ...geofence.toObject(), id: geofence._id.toString() } });
+    res.status(201).json({ success: true, data: fence });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PUT /api/geofences/:id
-// ─────────────────────────────────────────────────────────────────────────────
-exports.updateGeofence = async (req, res) => {
+exports.getGeofenceById = async (req, res) => {
   try {
-    const updates = { ...req.body };
-    delete updates._id; delete updates.id; delete updates.createdBy;
-
-    const geofence = await Geofence.findByIdAndUpdate(
-      req.params.id, { ...updates, updatedAt: new Date() }, { new: true, runValidators: true }
-    );
-    if (!geofence) return res.status(404).json({ success: false, message: 'Geofence not found' });
-
-    invalidateCache();
-    res.json({ success: true, message: 'Geofence updated', data: { ...geofence.toObject(), id: geofence._id.toString() } });
-  } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/geofences/:id
-// ─────────────────────────────────────────────────────────────────────────────
-exports.deleteGeofence = async (req, res) => {
-  try {
-    const geofence = await Geofence.findByIdAndDelete(req.params.id);
-    if (!geofence) return res.status(404).json({ success: false, message: 'Geofence not found' });
-    invalidateCache();
-    res.json({ success: true, message: 'Geofence deleted' });
+    const fence = await Geofence.findById(req.params.id);
+    if (!fence) return res.status(404).json({ success: false, message: 'Geofence not found' });
+    res.json({ success: true, data: fence });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Core check — called by GPS engine on every position update
-// Returns array of triggered alerts (entry/exit)
-// ─────────────────────────────────────────────────────────────────────────────
-exports.checkGeofences = async (vehicle, previousPosition) => {
+exports.updateGeofence = async (req, res) => {
   try {
-    const geofences = await getActiveGeofences();
-    if (geofences.length === 0) return;
-
-    for (const fence of geofences) {
-      // Skip if this fence is for specific vehicles and this one isn't in the list
-      if (fence.vehicleIds.length > 0 && !fence.vehicleIds.some(id => id.toString() === vehicle._id.toString())) {
-        continue;
-      }
-
-      const currentlyInside = isInsideGeofence(vehicle.latitude, vehicle.longitude, fence);
-      const wasInside       = previousPosition
-        ? isInsideGeofence(previousPosition.latitude, previousPosition.longitude, fence)
-        : null;
-
-      if (wasInside === null) continue;  // no previous position to compare
-
-      let alertType = null;
-      if (!wasInside && currentlyInside && fence.alertOnEntry) alertType = 'geofenceEnter';
-      if (wasInside && !currentlyInside && fence.alertOnExit)  alertType = 'geofenceExit';
-
-      if (!alertType) continue;
-
-      const alert = await Alert.create({
-        vehicleId:   vehicle._id,
-        vehicleReg:  vehicle.vehicleReg,
-        title:       alertType === 'geofenceEnter'
-          ? `📍 Entered: ${fence.name}`
-          : `🚧 Exited: ${fence.name}`,
-        message:     alertType === 'geofenceEnter'
-          ? `${vehicle.name} entered geofence "${fence.name}"`
-          : `${vehicle.name} left geofence "${fence.name}"`,
-        type:        alertType,
-        priority:    'high',
-        latitude:    vehicle.latitude,
-        longitude:   vehicle.longitude,
-        speed:       vehicle.speed,
-        pocName:     vehicle.pocName,
-        pocContact:  vehicle.pocContact,
-        vehicleType: vehicle.type,
-        timestamp:   new Date(),
-      });
-
-      if (global.io) {
-        global.io.emit('newAlert', { ...alert.toObject(), id: alert._id.toString() });
-      }
-    }
+    const fence = await Geofence.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    invalidateCache();
+    res.json({ success: true, data: fence });
   } catch (error) {
-    console.error('Geofence check error:', error.message);
+    res.status(400).json({ success: false, message: error.message });
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Geometry helpers
-// ─────────────────────────────────────────────────────────────────────────────
+exports.deleteGeofence = async (req, res) => {
+  try {
+    await Geofence.findByIdAndDelete(req.params.id);
+    invalidateCache();
+    res.json({ success: true, message: 'Geofence deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ── BATCH & TOGGLE OPS ──────────────────────────────────────────────────────
+
+exports.assignVehiclesToGeofence = async (req, res) => {
+  try {
+    const { vehicleIds } = req.body; 
+    const fence = await Geofence.findByIdAndUpdate(
+      req.params.id, 
+      { $set: { vehicleIds } }, 
+      { new: true }
+    );
+    invalidateCache();
+    res.json({ success: true, data: fence });
+  } catch (error) {
+    res.status(400).json({ success: false, message: error.message });
+  }
+};
+
+exports.toggleGeofenceActive = async (req, res) => {
+  try {
+    const fence = await Geofence.findById(req.params.id);
+    if (!fence) return res.status(404).json({ success: false, message: 'Geofence not found' });
+    
+    fence.isActive = !fence.isActive;
+    await fence.save();
+    invalidateCache();
+    
+    res.json({ success: true, isActive: fence.isActive });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ── OPTIMIZED GEOFENCE ENGINE ───────────────────────────────────────────────
+
+/**
+ * Triggered by the GPS Engine/Processor. 
+ * Checks if the vehicle has entered or exited any cached geofences.
+ */
+exports.checkGeofences = async (vehicle) => {
+  try {
+    const geofences = await getActiveGeofences();
+    if (!geofences || geofences.length === 0) return;
+
+    const prevFences = (vehicle.insideGeofences || []).map(id => id.toString());
+    const currentFences = [];
+
+    for (const fence of geofences) {
+      // 1. Assignment Filter: Check if fence is global or specific to this vehicle
+      const isAssigned = !fence.vehicleIds || 
+                         fence.vehicleIds.length === 0 || 
+                         fence.vehicleIds.some(id => id.toString() === vehicle._id.toString());
+      
+      if (!isAssigned) continue;
+
+      // 2. Geometry Check
+      const currentlyInside = isInsideGeofence(vehicle.latitude, vehicle.longitude, fence);
+      const fenceIdStr = fence._id.toString();
+      const wasInside = prevFences.includes(fenceIdStr);
+
+      if (currentlyInside) {
+        currentFences.push(fenceIdStr);
+      }
+
+      // 3. Logic: Trigger Entry/Exit Alerts
+      if (!wasInside && currentlyInside) {
+        await createGeofenceAlert(vehicle, fence, 'geofenceEnter');
+      } else if (wasInside && !currentlyInside) {
+        await createGeofenceAlert(vehicle, fence, 'geofenceExit');
+      }
+    }
+
+    // 4. State Update: Only hit the DB if the vehicle's geofence list actually changed
+    const hasChanged = prevFences.length !== currentFences.length || 
+                       prevFences.sort().join(',') !== currentFences.sort().join(',');
+
+    if (hasChanged) {
+      await Vehicle.findByIdAndUpdate(vehicle._id, { 
+        $set: { insideGeofences: currentFences } 
+      });
+    }
+
+  } catch (error) {
+    logger.error('🛡️ Geofence Engine Failure: %s', error.message);
+  }
+};
+
+// ── HELPERS ─────────────────────────────────────────────────────────────────
+
+async function createGeofenceAlert(vehicle, fence, alertType) {
+  try {
+    const isEnter = alertType === 'geofenceEnter';
+    
+    const alert = await Alert.create({
+      vehicleId:   vehicle._id,
+      imei:        vehicle.imei,
+      vehicleReg:  vehicle.vehicleReg,
+      type:        alertType,
+      title:       isEnter ? `📍 Entered: ${fence.name}` : `🚧 Exited: ${fence.name}`,
+      message:     `${vehicle.name || vehicle.imei} has ${isEnter ? 'entered' : 'exited'} the geofence zone.`,
+      priority:    'high',
+      latitude:    vehicle.latitude,
+      longitude:   vehicle.longitude,
+      speed:       vehicle.speed,
+      timestamp:   new Date(),
+    });
+
+    if (global.io) {
+      global.io.emit('newAlert', alert);
+      // Optional: push to a specific room for that vehicle
+      global.io.to(vehicle._id.toString()).emit('vehicleAlert', alert);
+    }
+  } catch (err) {
+    logger.error('❌ Alert Creation Error: %s', err.message);
+  }
+}
+
 function isInsideGeofence(lat, lng, fence) {
-  if (fence.geometry.type === 'Circle') {
-    const dist = geolib.getDistance(
-      { latitude: lat, longitude: lng },
-      { latitude: fence.geometry.center.latitude, longitude: fence.geometry.center.longitude }
-    );
-    return dist <= fence.geometry.radius;
-  }
+  try {
+    if (fence.geometry.type === 'Circle') {
+      const dist = geolib.getDistance(
+        { latitude: lat, longitude: lng },
+        { latitude: fence.geometry.center.latitude, longitude: fence.geometry.center.longitude }
+      );
+      return dist <= fence.geometry.radius;
+    }
+    
+    if (fence.geometry.type === 'Polygon') {
+      // GeoJSON standard is [lng, lat]. Geolib needs {latitude, longitude}.
+      // Polygons in GeoJSON are nested: [ [ [lng, lat], [lng, lat] ] ]
+      const polygonCoords = fence.geometry.coordinates[0].map(coord => ({
+        latitude: coord[1],
+        longitude: coord[0]
+      }));
 
-  if (fence.geometry.type === 'Polygon') {
-    return geolib.isPointInPolygon(
-      { latitude: lat, longitude: lng },
-      fence.geometry.coordinates.map(c => ({ latitude: c[0], longitude: c[1] }))
-    );
+      return geolib.isPointInPolygon(
+        { latitude: lat, longitude: lng },
+        polygonCoords
+      );
+    }
+  } catch (err) {
+    return false;
   }
-
   return false;
 }

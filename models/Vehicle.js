@@ -1,75 +1,148 @@
-// models/Vehicle.js
 'use strict';
 
 const mongoose = require('mongoose');
 
 const vehicleSchema = new mongoose.Schema({
-  // ── Identity ──────────────────────────────────────────────────────────────
-  name:       { type: String, required: [true, 'Vehicle name is required'], trim: true, maxlength: 100 },
-  vehicleReg: { type: String, required: [true, 'Vehicle registration / IMEI required'], trim: true, uppercase: true, unique: true },
-  type:       { type: String, enum: ['car','truck','bike','auto','bus','van','ambulance','tractor','unknown'], default: 'car' },
+  name: {
+    type: String,
+    required: [true, 'Vehicle name is required'],
+    trim: true,
+    maxlength: 100
+  },
 
-  // ── IMEI / Device ─────────────────────────────────────────────────────────
-  imei:     { type: String, trim: true, sparse: true, index: true },
-  protocol: { type: String, default: 'GT06' },  // GT06 | NMEA | HTTP
+  vehicleReg: {
+    type: String,
+    required: [true, 'Vehicle registration required'],
+    trim: true,
+    unique: true,
+    uppercase: true
+  },
 
-  // ── POC / Driver ─────────────────────────────────────────────────────────
+  type: {
+    type: String,
+    enum: ['car','truck','bike','auto','bus','van','ambulance','tractor','unknown'],
+    default: 'car'
+  },
+
+  imei: {
+    type: String,
+    trim: true,
+    unique: true,
+    sparse: true
+  },
+
+  protocol: {
+    type: String,
+    default: 'GT06'
+  },
+
   pocName:    { type: String, trim: true },
   pocContact: { type: String, trim: true },
 
-  // ── GPS Position ──────────────────────────────────────────────────────────
-  latitude:  { type: Number, default: 28.6139 },
-  longitude: { type: Number, default: 77.2090 },
+  // ── Live Telemetry (current/last received values) ──────────────────────────
+  latitude:  { type: Number, default: null },
+longitude: { type: Number, default: null },
   altitude:  { type: Number, default: 0 },
-  speed:     { type: Number, default: 0, min: 0 },
-  heading:   { type: Number, default: 0, min: 0, max: 360 },
+  speed:     { type: Number, default: 0 },
+  heading:   { type: Number, default: 0 },
 
-  // ── Telemetry ─────────────────────────────────────────────────────────────
-  fuel:         { type: Number, default: 100, min: 0, max: 100 },
-  batteryLevel: { type: Number, default: 100, min: 0, max: 100 },
+  fuel:         { type: Number, default: 100 },
+  batteryLevel: { type: Number, default: 100 },
   gpsSignal:    { type: Boolean, default: true },
 
-  // ── Status ────────────────────────────────────────────────────────────────
-  status:   { type: String, enum: ['moving','idle','parked','offline','towing','unknown'], default: 'idle' },
+  status: {
+    type: String,
+    enum: ['moving','idle','parked','static','offline','towing','unknown'],
+    default: 'idle'
+  },
+
+  // ── State Management ───────────────────────────────────────────────────────
   isLive:   { type: Boolean, default: false },
   isOnline: { type: Boolean, default: false },
-  location: { type: String },  // reverse-geocoded address
 
-  lastUpdate: { type: Date, default: Date.now, index: true },
+  insideGeofences: [{ type: String }],
 
-  // ── Daily analytics (updated by GPS engine) ───────────────────────────────
+  location:       { type: String },   // reverse-geocoded address string
+  lastUpdate:     { type: Date, default: Date.now },
+  lastWanWaySync: { type: Date },
+
+  // ── Last Known Good State ──────────────────────────────────────────────────
+  // Only written when device was online AND had a valid GPS fix.
+  // Survives offline periods — use this in your UI when isOnline === false.
+  lastKnownLocation: {
+    latitude:  { type: Number },
+    longitude: { type: Number },
+    speed:     { type: Number },
+    heading:   { type: Number },
+    altitude:  { type: Number },
+    voltage:   { type: Number },   // e.g. 12.9V from IOP GPS
+    odometer:  { type: Number },   // e.g. 2997 KM from IOP GPS
+    address:   { type: String },   // reverse-geocoded at time of last ping
+    timestamp: { type: Date },     // actual GPS timestamp from device (not server time)
+  },
+
+  // When did we last see this device online with valid GPS? (drives "Offline Xh" label)
+  lastOnlineAt: { type: Date },
+
+  // ── Analytics ─────────────────────────────────────────────────────────────
   analytics: {
     todayDistance: { type: Number, default: 0 },
     avgSpeed:      { type: Number, default: 0 },
     totalTrips:    { type: Number, default: 0 },
-  },
+  }
+
 }, {
   timestamps: true,
   versionKey: false,
 });
 
-// ── Indexes ───────────────────────────────────────────────────────────────────
-vehicleSchema.index({ vehicleReg: 1 }, { unique: true });
-vehicleSchema.index({ imei: 1 },       { sparse: true });
+// ── INDEXES ────────────────────────────────────────────────────────────────
 vehicleSchema.index({ isLive: 1, status: 1 });
-vehicleSchema.index({ latitude: 1, longitude: 1 });
 vehicleSchema.index({ lastUpdate: -1 });
+vehicleSchema.index({ lastOnlineAt: -1 });  // ← for "offline vehicles" queries
 
-// ── toJSON — map _id → id ─────────────────────────────────────────────────────
+// ── JSON TRANSFORM ─────────────────────────────────────────────────────────
 vehicleSchema.set('toJSON', {
+  virtuals: true,
   transform(doc, ret) {
     ret.id  = ret._id.toString();
-    // Flutter reads lat/lng so add aliases here
     ret.lat = ret.latitude;
     ret.lng = ret.longitude;
+
+    // ✅ Convenience: expose offlineDuration in API response automatically
+    // Frontend can directly show "Offline 3h 24m" without computing it
+    if (!ret.isOnline && ret.lastOnlineAt) {
+      const ms = Date.now() - new Date(ret.lastOnlineAt).getTime();
+      const totalMinutes = Math.floor(ms / 60000);
+      const days    = Math.floor(totalMinutes / 1440);
+      const hours   = Math.floor((totalMinutes % 1440) / 60);
+      const minutes = totalMinutes % 60;
+
+      ret.offlineDuration = days > 0
+        ? `${days}d ${hours}h`
+        : hours > 0
+          ? `${hours}h ${minutes}m`
+          : `${minutes}m`;
+    } else {
+      ret.offlineDuration = null;
+    }
+
     delete ret._id;
     return ret;
   },
 });
 
-// ── Virtual: isOnlineNow (within 5 min) ───────────────────────────────────────
+// ── VIRTUALS ───────────────────────────────────────────────────────────────
+// True real-time check: was the device heard from in the last 5 minutes?
 vehicleSchema.virtual('isOnlineNow').get(function () {
   return this.lastUpdate && (Date.now() - this.lastUpdate.getTime()) < 5 * 60 * 1000;
 });
 
-module.exports = mongoose.model('Vehicle', vehicleSchema);
+// How long since we last saw this device online (in milliseconds)
+// Use in backend logic: if (vehicle.offlineMs > 24 * 60 * 60 * 1000) { alert... }
+vehicleSchema.virtual('offlineMs').get(function () {
+  if (this.isOnline || !this.lastOnlineAt) return 0;
+  return Date.now() - this.lastOnlineAt.getTime();
+});
+
+module.exports = mongoose.models.Vehicle || mongoose.model('Vehicle', vehicleSchema);

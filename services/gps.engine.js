@@ -1,243 +1,137 @@
-// services/gps.engine.js
 'use strict';
 
 const geolib       = require('geolib');
-const LocationPing = require('../models/LocationPing');
-const Trip         = require('../models/Trip');
 const Alert        = require('../models/Alert');
-const Geofence     = require('../models/Geofence');
-const devices      = require('../config/devices');
-
-// ── Alert dedup (prevents spam every 10s) ────────────────────────────────────
-const alertDedup = new Map();
-const DEDUP_MS   = parseInt(process.env.ALERT_DEDUP_WINDOW_MINUTES || '5') * 60 * 1000;
-
-// ── Previous geofence state per vehicle ──────────────────────────────────────
-const geofenceState = new Map(); // vehicleId → Set of geofenceIds vehicle is inside
+const Trip         = require('../models/Trip');
+const Geofence      = require('../models/Geofence');
 
 class GPSEngine {
-  static async processUpdate(vehicle) {
+  /**
+   * Main Entry Point called by the Data Processor
+   */
+  static async processUpdate(vehicle, newData) {
     try {
-      const prevPing = await LocationPing.findOne(
-        { vehicleId: vehicle._id },
-        'latitude longitude status speed'
-      ).sort({ timestamp: -1 }).lean();
+      // 1. Calculate Distance (Delta)
+      const distM = geolib.getDistance(
+        { latitude: vehicle.latitude, longitude: vehicle.longitude },
+        { latitude: newData.latitude, longitude: newData.longitude }
+      );
 
-      await Promise.all([
-        this._detectTrip(vehicle, prevPing),
-        this._checkAlerts(vehicle),
-        this._checkGeofences(vehicle),
-      ]);
+      // 2. Trip State Logic
+      // We pass the vehicle object so it can accumulate distance in memory before the final bulk save
+      await this._handleTripState(vehicle, newData, distM);
+
+      // 3. Geofence Logic
+      await this._checkGeofences(vehicle, newData);
+
+      // 4. Critical Alerts (Overspeed, SOS, etc)
+      if (newData.speed > 80) { // Example threshold
+        await this._createAlert(vehicle, newData, 'overspeed', `High Speed Detected: ${newData.speed} km/h`);
+      }
+
     } catch (e) {
-      console.error(`GPS engine error (${vehicle.vehicleReg}):`, e.message);
+      console.error(`🚀 Engine Error [${vehicle.imei}]:`, e.message);
     }
   }
 
-  // ── Trip detection ──────────────────────────────────────────────────────────
-  static async _detectTrip(vehicle, prevPing) {
-    if (!prevPing) return;
+  static async _handleTripState(vehicle, newData, distM) {
+    const isMoving = newData.speed > 5;
+    const distKm = distM / 1000;
 
-    const IDLE_MIN   = parseInt(process.env.IDLE_TIMEOUT_MINUTES || '10');
-    const MIN_DIST_M = 100;
+    // Increment today's analytics in the vehicle object
+    if (isMoving) {
+      vehicle.analytics.todayDistance = (vehicle.analytics.todayDistance || 0) + distKm;
+    }
 
-    const timeDiffMin = (new Date(vehicle.lastUpdate) - new Date(prevPing.timestamp ?? Date.now())) / 60000;
-    const distM = geolib.getDistance(
-      { latitude: prevPing.latitude,  longitude: prevPing.longitude },
-      { latitude: vehicle.latitude,   longitude: vehicle.longitude  }
-    );
-
-    // Trip START
-    if (prevPing.status === 'idle' && vehicle.status === 'moving' && distM > MIN_DIST_M) {
+    // TRIP START: Transition from static to moving
+    if (vehicle.status !== 'moving' && isMoving) {
       await Trip.create({
-        vehicleId:     vehicle._id,
-        startTime:     vehicle.lastUpdate,
-        startLocation: { latitude: vehicle.latitude, longitude: vehicle.longitude },
-        fuelStart:     vehicle.fuel,
+        vehicleId: vehicle._id,
+        imei: vehicle.imei,
+        startTime: new Date(),
+        startLocation: { latitude: newData.latitude, longitude: newData.longitude },
+        isCompleted: false
       });
-      console.log(`🚗 Trip started: ${vehicle.vehicleReg}`);
     }
 
-    // Trip END
-    if (prevPing.status === 'moving' && ['idle','parked'].includes(vehicle.status) && timeDiffMin > IDLE_MIN) {
-      const trip = await Trip.findOne({ vehicleId: vehicle._id, isCompleted: false }).sort({ startTime: -1 });
-      if (trip) {
-        const durMin  = (new Date(vehicle.lastUpdate) - trip.startTime) / 60000;
-        const distKm  = geolib.getDistance(
-          { latitude: trip.startLocation.latitude, longitude: trip.startLocation.longitude },
-          { latitude: vehicle.latitude, longitude: vehicle.longitude }
-        ) / 1000;
+    // TRIP UPDATE: If trip is ongoing, update the distance and max speed
+    if (isMoving) {
+      await Trip.updateOne(
+        { vehicleId: vehicle._id, isCompleted: false },
+        { 
+          $inc: { totalDistance: distKm },
+          $max: { maxSpeed: newData.speed },
+          $set: { endTime: new Date() } // Keep the end time fresh
+        }
+      );
+    }
+  }
 
-        Object.assign(trip, {
-          endTime:       vehicle.lastUpdate,
-          duration:      durMin,
-          endLocation:   { latitude: vehicle.latitude, longitude: vehicle.longitude },
-          totalDistance: distKm,
-          avgSpeed:      durMin > 0 ? distKm / (durMin / 60) : 0,
-          fuelEnd:       vehicle.fuel,
-          fuelConsumed:  Math.max(0, (trip.fuelStart || 0) - vehicle.fuel),
-          isCompleted:   true,
-        });
-        trip.efficiency = trip.fuelConsumed > 0 ? distKm / trip.fuelConsumed : 0;
-        await trip.save();
-        console.log(`✅ Trip ended: ${vehicle.vehicleReg} — ${distKm.toFixed(2)}km`);
+  static async _checkGeofences(vehicle, newData) {
+    // 💡 Performance Tip: For 20k devices, you should cache 'fences' in a global variable 
+    // and refresh it every 5 minutes rather than querying the DB on every GPS ping.
+    const fences = await Geofence.find({ isActive: true }).lean();
+
+    const currentInsideIds = (vehicle.insideGeofences || []).map(id => id.toString());
+    const newInsideIds = [];
+
+    for (const fence of fences) {
+      // Optimization: Check if fence applies to this vehicle or is global
+      const isAssigned = !fence.vehicleIds || fence.vehicleIds.length === 0 || 
+                         fence.vehicleIds.some(id => id.toString() === vehicle._id.toString());
+      
+      if (!isAssigned) continue;
+
+      const isInside = this._isPointInFence(newData.latitude, newData.longitude, fence);
+      const fenceId = fence._id.toString();
+
+      if (isInside) {
+        newInsideIds.push(fence._id);
+        if (!currentInsideIds.includes(fenceId)) {
+          await this._createAlert(vehicle, newData, 'geofenceEnter', `Entered Geofence: ${fence.name}`);
+        }
+      } else if (currentInsideIds.includes(fenceId)) {
+        await this._createAlert(vehicle, newData, 'geofenceExit', `Exited Geofence: ${fence.name}`);
       }
     }
+
+    // Update vehicle state - the Data Processor will save this via bulkWrite
+    vehicle.insideGeofences = newInsideIds;
   }
 
-  // ── Alert checks ─────────────────────────────────────────────────────────────
-  static async _checkAlerts(vehicle) {
-    const cfg        = devices.getByIMEI(vehicle.imei) || {};
-    const speedLimit = cfg.speedLimit ?? parseInt(process.env.OVERSPEED_THRESHOLD_KMH || '80');
-    const fuelAlert  = cfg.fuelAlert  ?? parseInt(process.env.LOW_FUEL_THRESHOLD_PCT   || '15');
-    const battAlert  = cfg.battAlert  ?? parseInt(process.env.LOW_BATTERY_THRESHOLD_PCT || '20');
-
-    const toCreate = [];
-
-    const add = (type, priority, title, message, extra = {}) => {
-      if (!this._canAlert(vehicle._id, type)) return;
-      toCreate.push({
-        vehicleId:   vehicle._id,
-        vehicleReg:  vehicle.vehicleReg,
-        title, message, type, priority,
-        latitude:    vehicle.latitude,
-        longitude:   vehicle.longitude,
-        speed:       vehicle.speed,
-        pocName:     vehicle.pocName,
-        pocContact:  vehicle.pocContact,
-        vehicleType: vehicle.type,
-        timestamp:   new Date(),
-        ...extra,
-      });
-    };
-
-    // Overspeed
-    if (vehicle.speed > speedLimit && vehicle.status === 'moving') {
-      add('overspeed', 'critical',
-        '🚨 Overspeed Alert',
-        `${vehicle.name} at ${vehicle.speed.toFixed(0)} km/h (limit: ${speedLimit} km/h)`);
+  static _isPointInFence(lat, lng, fence) {
+    if (fence.geometry.type === 'Circle') {
+      return geolib.getDistance(
+        { latitude: lat, longitude: lng },
+        { latitude: fence.geometry.center.latitude, longitude: fence.geometry.center.longitude }
+      ) <= fence.geometry.radius;
     }
-
-    // Low fuel
-    if (vehicle.fuel > 0 && vehicle.fuel < fuelAlert) {
-      add('lowFuel', 'medium',
-        '⛽ Low Fuel Warning',
-        `${vehicle.name} fuel at ${vehicle.fuel.toFixed(0)}%`);
-    }
-
-    // Low battery
-    if (vehicle.batteryLevel > 0 && vehicle.batteryLevel < battAlert) {
-      add('lowBattery', 'medium',
-        '🔋 Low Battery',
-        `${vehicle.name} battery at ${vehicle.batteryLevel.toFixed(0)}%`);
-    }
-
-    // GPS lost
-    if (!vehicle.gpsSignal) {
-      add('gpsLost', 'high',
-        '📡 GPS Signal Lost',
-        `${vehicle.name} has lost GPS signal`);
-    }
-
-    if (toCreate.length === 0) return;
-
-    const created = await Alert.insertMany(toCreate, { ordered: false });
-    for (const a of created) {
-      if (global.io) global.io.emit('newAlert', { ...a.toObject(), id: a._id.toString() });
-    }
-  }
-
-  // ── Geofence check ────────────────────────────────────────────────────────
-  static async _checkGeofences(vehicle) {
-    try {
-      const fences = await Geofence.find({ isActive: true }).lean();
-      if (!fences.length) return;
-
-      const vid      = vehicle._id.toString();
-      const prevInside = geofenceState.get(vid) || new Set();
-      const nowInside  = new Set();
-
-      for (const fence of fences) {
-        // Skip if this fence targets specific vehicles and this isn't one
-        if (fence.vehicleIds?.length > 0) {
-          const applies = fence.vehicleIds.some(id => id.toString() === vid);
-          if (!applies) continue;
-        }
-
-        const inside = isInsideFence(vehicle.latitude, vehicle.longitude, fence);
-        if (inside) nowInside.add(fence._id.toString());
-
-        const wasInside = prevInside.has(fence._id.toString());
-
-        if (!wasInside && inside && fence.alertOnEntry) {
-          await this._geofenceAlert(vehicle, fence, 'geofenceEnter');
-        }
-        if (wasInside && !inside && fence.alertOnExit) {
-          await this._geofenceAlert(vehicle, fence, 'geofenceExit');
-        }
-      }
-
-      geofenceState.set(vid, nowInside);
-    } catch (e) {
-      console.error('Geofence check error:', e.message);
-    }
-  }
-
-  static async _geofenceAlert(vehicle, fence, type) {
-    if (!this._canAlert(vehicle._id, `${type}_${fence._id}`)) return;
-
-    const isEntry = type === 'geofenceEnter';
-    const alert = await Alert.create({
-      vehicleId:   vehicle._id,
-      vehicleReg:  vehicle.vehicleReg,
-      title:       isEntry ? `📍 Entered: ${fence.name}` : `🚧 Exited: ${fence.name}`,
-      message:     isEntry
-        ? `${vehicle.name} entered geofence "${fence.name}"`
-        : `${vehicle.name} left geofence "${fence.name}"`,
-      type, priority: 'high',
-      latitude:    vehicle.latitude,
-      longitude:   vehicle.longitude,
-      speed:       vehicle.speed,
-      pocName:     vehicle.pocName,
-      pocContact:  vehicle.pocContact,
-      vehicleType: vehicle.type,
-      timestamp:   new Date(),
-    });
-
-    if (global.io) global.io.emit('newAlert', { ...alert.toObject(), id: alert._id.toString() });
-  }
-
-  // ── Dedup ─────────────────────────────────────────────────────────────────
-  static _canAlert(vehicleId, type) {
-    const key  = `${vehicleId}_${type}`;
-    const last = alertDedup.get(key);
-    if (last && Date.now() - last < DEDUP_MS) return false;
-    alertDedup.set(key, Date.now());
-    return true;
-  }
-}
-
-// Clean dedup store every 30 min
-setInterval(() => {
-  const cut = Date.now() - DEDUP_MS;
-  for (const [k, v] of alertDedup) if (v < cut) alertDedup.delete(k);
-}, 30 * 60 * 1000);
-
-// Geometry helpers
-function isInsideFence(lat, lng, fence) {
-  if (fence.geometry.type === 'Circle') {
-    const d = geolib.getDistance(
-      { latitude: lat, longitude: lng },
-      { latitude: fence.geometry.center.latitude, longitude: fence.geometry.center.longitude }
-    );
-    return d <= fence.geometry.radius;
-  }
-  if (fence.geometry.type === 'Polygon') {
+    // Polygon check
     return geolib.isPointInPolygon(
       { latitude: lat, longitude: lng },
       fence.geometry.coordinates.map(c => ({ latitude: c[0], longitude: c[1] }))
     );
   }
-  return false;
+
+  static async _createAlert(vehicle, data, type, title) {
+    const alert = await Alert.create({
+      vehicleId: vehicle._id,
+      imei: vehicle.imei,
+      type,
+      title,
+      latitude: data.latitude,
+      longitude: data.longitude,
+      speed: data.speed,
+      timestamp: new Date(),
+      priority: (type === 'sos' || type === 'powerCut') ? 'critical' : 'high'
+    });
+
+    // Real-time Push to Flutter via Socket.io
+    if (global.io) {
+      global.io.emit('newAlert', alert);
+      global.io.to(vehicle._id.toString()).emit('vehicleAlert', alert);
+    }
+  }
 }
 
 module.exports = GPSEngine;

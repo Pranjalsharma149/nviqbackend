@@ -1,11 +1,11 @@
-// models/Alert.js
 'use strict';
 
 const mongoose = require('mongoose');
 
 const alertSchema = new mongoose.Schema({
   vehicleId:  { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle', required: true, index: true },
-  vehicleReg: { type: String },
+  vehicleReg: { type: String, index: true },
+  imei:       { type: String, index: true }, // Crucial for WanWay API correlation
 
   title:   { type: String, required: true, maxlength: 100 },
   message: { type: String, required: true, maxlength: 500 },
@@ -17,26 +17,32 @@ const alertSchema = new mongoose.Schema({
       'unauthorizedMovement','ignitionOn','ignitionOff',
       'harshBraking','harshAcceleration','lowFuel','lowBattery',
       'gpsLost','idle','parking','engineOverheat','maintenanceDue',
+      'sos' 
     ],
     required: true,
     index: true,
   },
 
-  priority: { type: String, enum: ['critical','high','medium','low'], default: 'low', index: true },
+  priority: { 
+    type: String, 
+    enum: ['critical','high','medium','low'], 
+    default: 'low', 
+    index: true 
+  },
 
-  // Snapshot at time of alert
+  // Snapshot of location when alert triggered
   latitude:  { type: Number },
   longitude: { type: Number },
   speed:     { type: Number },
 
-  // POC snapshot (denormalized for fast reads)
+  // Denormalized snapshots for O(1) read performance on Flutter app
   pocName:     { type: String },
   pocContact:  { type: String },
   vehicleType: { type: String },
 
-  // State
-  isRead:         { type: Boolean, default: false, index: true },
-  isAcknowledged: { type: Boolean, default: false },
+  // Interaction State
+  isRead:          { type: Boolean, default: false, index: true },
+  isAcknowledged: { type: Boolean, default: false, index: true },
   acknowledgedAt: { type: Date },
   acknowledgedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
 
@@ -45,12 +51,13 @@ const alertSchema = new mongoose.Schema({
   versionKey: false,
 });
 
-// ── Compound indexes for Flutter alert screen queries ─────────────────────────
+// ── Compound indexes: Makes the "Alerts" tab in Flutter instantaneous ──────────
 alertSchema.index({ isRead: 1, timestamp: -1 });
 alertSchema.index({ priority: 1, isRead: 1 });
 alertSchema.index({ vehicleId: 1, type: 1, timestamp: -1 });
 
-// ── Auto-expire alerts after 30 days ─────────────────────────────────────────
+// ── TTL Index: Auto-purges old data to prevent DB bloat ────────────────────────
+// Deletes document 30 days after 'timestamp'
 alertSchema.index({ timestamp: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 30 });
 
 alertSchema.set('toJSON', {

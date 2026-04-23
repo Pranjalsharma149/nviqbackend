@@ -1,18 +1,35 @@
-// routes/vehicles.routes.js
 'use strict';
 
-const router = require('express').Router();
-const ctrl   = require('../controllers/vehicleController');
+const express = require('express');
+const router  = express.Router();
+const vehicleController = require('../controllers/vehicleController.js');
 const { protect, requireRole } = require('../middleware/auth');
 
-// ✅ CRITICAL: static routes MUST come before /:id
-router.get('/stats/summary',    protect, ctrl.getStatsSummary);
-router.get('/location/:imei',   protect, ctrl.getVehicleLocation);
+// ─────────────────────────────────────────────
+// 📌 SPECIAL ROUTES (MUST COME FIRST)
+// ─────────────────────────────────────────────
 
-router.get('/',    protect, ctrl.getVehicles);
-router.post('/',   protect, ctrl.addVehicle);
-router.get('/:id',    protect, ctrl.getVehicleById);
-router.put('/:id',    protect, ctrl.updateVehicle);
-router.delete('/:id', protect, requireRole('admin','fleet_manager'), ctrl.deleteVehicle);
+// Internal/WanWay use: Single device location update
+router.post('/update-location', vehicleController.updateLocation);
+
+// Public/Flutter use: Get all currently moving vehicles
+router.get('/live/all', protect, vehicleController.getLiveVehicles);
+
+
+// ─────────────────────────────────────────────
+// 📌 CRUD ROUTES
+// ─────────────────────────────────────────────
+
+// Get fleet list (Optimized with 1000 limit)
+router.get('/', protect, vehicleController.getAllVehicles);
+
+// Add new vehicle to fleet
+router.post('/', protect, requireRole('admin', 'fleet_manager'), vehicleController.createVehicle);
+
+// Single vehicle operations
+router.get('/:id', protect, vehicleController.getVehicleById);
+router.put('/:id', protect, requireRole('admin', 'fleet_manager'), vehicleController.updateVehicle);
+router.delete('/:id', protect, requireRole('admin'), vehicleController.deleteVehicle);
+
 
 module.exports = router;

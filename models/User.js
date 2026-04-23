@@ -1,4 +1,3 @@
-// models/User.js
 'use strict';
 
 const mongoose = require('mongoose');
@@ -11,12 +10,14 @@ const userSchema = new mongoose.Schema({
   password: { type: String, required: [true, 'Password is required'], minlength: 6, select: false },
   phone:    { type: String, trim: true, sparse: true },
   role:     { type: String, enum: ['admin','fleet_manager','driver','supervisor'], default: 'fleet_manager' },
+  
+  status:   { type: String, enum: ['active', 'inactive', 'suspended'], default: 'active', index: true },
+  
   plan:     { type: String, default: 'Free Plan' },
   location: { type: String, trim: true },
   avatar:   { type: String },
-  fcmToken: { type: String },   // for FCM push notifications
+  fcmToken: { type: String }, // Store for Firebase Push Notifications
 
-  // Password reset
   resetPasswordToken:  { type: String, select: false },
   resetPasswordExpire: { type: Date,   select: false },
 
@@ -26,11 +27,7 @@ const userSchema = new mongoose.Schema({
   versionKey: false,
 });
 
-// ── Indexes ───────────────────────────────────────────────────────────────────
-userSchema.index({ email: 1 }, { unique: true });
-userSchema.index({ phone: 1 }, { sparse: true });
-
-// ── Hash password before save ─────────────────────────────────────────────────
+// ── Password Hashing ─────────────────────────────────────────────────────────
 userSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();
   const salt = await bcrypt.genSalt(12);
@@ -38,12 +35,11 @@ userSchema.pre('save', async function (next) {
   next();
 });
 
-// ── Compare password ──────────────────────────────────────────────────────────
+// ── Methods ──────────────────────────────────────────────────────────────────
 userSchema.methods.matchPassword = async function (entered) {
   return bcrypt.compare(entered, this.password);
 };
 
-// ── Generate JWT ──────────────────────────────────────────────────────────────
 userSchema.methods.getSignedJwtToken = function () {
   return jwt.sign(
     { id: this._id, role: this.role },
@@ -52,7 +48,6 @@ userSchema.methods.getSignedJwtToken = function () {
   );
 };
 
-// ── toJSON — remove sensitive fields ─────────────────────────────────────────
 userSchema.set('toJSON', {
   transform(doc, ret) {
     ret.id = ret._id.toString();

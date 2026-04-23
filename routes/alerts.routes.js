@@ -1,19 +1,27 @@
-// routes/alerts.routes.js
 'use strict';
 
 const router = require('express').Router();
 const ctrl   = require('../controllers/alertController');
-const { protect } = require('../middleware/auth');
+const { protect, requireRole } = require('../middleware/auth');
 
-// ✅ CRITICAL: static routes BEFORE /:id — otherwise 'unread-count'
-// and 'acknowledge-all' get matched as MongoDB ObjectId params → CastError
-router.get('/unread-count',      protect, ctrl.getUnreadCount);
-router.put('/acknowledge-all',   protect, ctrl.acknowledgeAll);
-router.post('/test',             protect, ctrl.createTestAlert);
+// ── Static Routes (Precedence Matters!) ──────────────────────────────────────
+// These must be defined before /:id to prevent routing conflicts
+router.get('/unread-count',    protect, ctrl.getUnreadCount);
+router.put('/acknowledge-all', protect, ctrl.acknowledgeAll);
 
-router.get('/',     protect, ctrl.getAlerts);
-router.get('/:id',  protect, ctrl.getAlertById);
+// ── Admin-Only Maintenance ───────────────────────────────────────────────────
+router.delete('/purge-old',    protect, requireRole('admin'), ctrl.purgeOldAlerts);
+
+// ── Development & Testing ───────────────────────────────────────────────────
+router.post('/test',           protect, ctrl.createTestAlert);
+
+// ── Resource CRUD ────────────────────────────────────────────────────────────
+router.get('/',      protect, ctrl.getAlerts);
+router.get('/:id',   protect, ctrl.getAlertById);
+
 router.put('/:id/acknowledge', protect, ctrl.acknowledgeAlert);
-router.delete('/:id',          protect, ctrl.deleteAlert);
+
+// Note: requireRole('admin') added here to prevent accidental data loss by staff
+router.delete('/:id',          protect, requireRole('admin'), ctrl.deleteAlert);
 
 module.exports = router;

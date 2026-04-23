@@ -1,18 +1,20 @@
-// middleware/auth.js
 'use strict';
 
 const jwt  = require('jsonwebtoken');
 const User = require('../models/User');
 
-// ── In-memory user cache (avoids DB lookup on every request) ──────────────────
-// Keyed by user ID, evicted after 5 minutes
+// ── In-memory user cache ──────────────────────────────────────────────────────
+// Prevents DB bottleneck at 20k device scale
 const userCache  = new Map();
-const CACHE_TTL  = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL  = 5 * 60 * 1000; 
 
 function getCachedUser(id) {
   const entry = userCache.get(id);
   if (!entry) return null;
-  if (Date.now() - entry.ts > CACHE_TTL) { userCache.delete(id); return null; }
+  if (Date.now() - entry.ts > CACHE_TTL) { 
+    userCache.delete(id); 
+    return null; 
+  }
   return entry.user;
 }
 
@@ -21,18 +23,22 @@ function setCachedUser(id, user) {
 }
 
 // ── protect middleware ────────────────────────────────────────────────────────
-const protect = async (req, res, next) => {
-  // ── Dev mock token (must be checked FIRST, before !token guard) ────────────
-  if (process.env.NODE_ENV === 'development') {
-    const header = req.headers.authorization || '';
-    if (header.startsWith('Bearer mock_')) {
-      req.user = { _id: 'dev_user_001', id: 'dev_user_001', name: 'Dev User', email: 'dev@nviq.com', role: 'admin' };
+// Validates the JWT and attaches the user object to the request
+exports.protect = async (req, res, next) => {
+  const header = req.headers.authorization || '';
+
+  // 1. Dev mock token (helpful for testing without logging in repeatedly)
+  if (process.env.NODE_ENV === 'development' && header.startsWith('Bearer mock_')) {
+      req.user = { 
+        _id: 'dev_user_001', 
+        id: 'dev_user_001', 
+        name: 'Dev User', 
+        role: 'admin' 
+      };
       return next();
-    }
   }
 
-  // ── Extract token ──────────────────────────────────────────────────────────
-  const header = req.headers.authorization || '';
+  // 2. Extract and Verify JWT
   if (!header.startsWith('Bearer ')) {
     return res.status(401).json({ success: false, message: 'Not authorized — no token' });
   }
@@ -42,15 +48,26 @@ const protect = async (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // Try cache first — avoids DB hit on every API call
+    // 3. Try Cache first
     let user = getCachedUser(decoded.id);
+    
+    // 4. Fallback to DB if cache miss
     if (!user) {
-      user = await User.findById(decoded.id).select('-password -resetPasswordToken -resetPasswordExpire').lean();
+      user = await User.findById(decoded.id)
+        .select('-password -resetPasswordToken -resetPasswordExpire')
+        .lean();
+
       if (!user) {
         return res.status(401).json({ success: false, message: 'User not found' });
       }
+
       user.id = user._id.toString();
       setCachedUser(decoded.id, user);
+    }
+
+    // 5. Security Check: Ensure user hasn't been deactivated
+    if (user.status === 'inactive') {
+        return res.status(403).json({ success: false, message: 'Account is deactivated' });
     }
 
     req.user = user;
@@ -63,12 +80,14 @@ const protect = async (req, res, next) => {
   }
 };
 
-// ── role-based guard ──────────────────────────────────────────────────────────
-const requireRole = (...roles) => (req, res, next) => {
-  if (!roles.includes(req.user?.role)) {
-    return res.status(403).json({ success: false, message: `Access denied — requires role: ${roles.join(' or ')}` });
+// ── requireRole middleware ───────────────────────────────────────────────────
+// Restricts access based on user role (e.g., 'admin', 'operator')
+exports.requireRole = (...roles) => (req, res, next) => {
+  if (!req.user || !roles.includes(req.user.role)) {
+    return res.status(403).json({ 
+      success: false, 
+      message: `Access denied — requires role: ${roles.join(' or ')}` 
+    });
   }
   next();
 };
-
-module.exports = { protect, requireRole };

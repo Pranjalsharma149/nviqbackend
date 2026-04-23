@@ -1,81 +1,71 @@
-// scripts/seedDevices.js
-//
-// Called automatically at server boot.
-// Creates a Vehicle document in MongoDB for every device in config/devices.js
-// If vehicle already exists (matched by IMEI) — skips it, no duplicate.
-// Run manually: node scripts/seedDevices.js
-
 'use strict';
 
 async function seedDevices() {
   const Vehicle = require('../models/Vehicle');
   const { REGISTERED_DEVICES } = require('../config/devices');
 
-  let created = 0, skipped = 0;
-
-  for (const d of REGISTERED_DEVICES) {
-    try {
-      // Check by IMEI first, then by vehicleReg
-      const exists = await Vehicle.findOne({
-        $or: [
-          { imei: d.imei },
-          { vehicleReg: d.vehicleReg.toUpperCase() },
-        ],
-      });
-
-      if (exists) {
-        // Update IMEI if missing (handles vehicles registered without IMEI)
-        if (!exists.imei && d.imei) {
-          await Vehicle.findByIdAndUpdate(exists._id, { imei: d.imei, protocol: d.protocol || 'GT06' });
-          console.log(`🔗 Linked IMEI ${d.imei} → ${exists.name}`);
-        } else {
-          console.log(`⏭  Already exists: ${d.name} (${d.imei})`);
-        }
-        skipped++;
-        continue;
-      }
-
-      await Vehicle.create({
-        imei:        d.imei,
-        vehicleReg:  d.vehicleReg.toUpperCase(),
-        name:        d.name,
-        type:        d.type        || 'car',
-        protocol:    d.protocol    || 'GT06',
-        pocName:     d.pocName     || '',
-        pocContact:  d.pocContact  || '',
-        latitude:    28.6139,    // Delhi — updates on first GPS ping
-        longitude:   77.2090,
-        speed:       0,
-        heading:     0,
-        fuel:        100,
-        batteryLevel:100,
-        gpsSignal:   false,
-        status:      'offline',
-        isLive:      false,
-        isOnline:    false,
-        lastUpdate:  new Date(),
-      });
-
-      console.log(`✅ Created vehicle: ${d.name} (IMEI: ${d.imei})`);
-      created++;
-    } catch (e) {
-      console.error(`❌ Failed to seed ${d.imei}:`, e.message);
-    }
+  if (!REGISTERED_DEVICES || REGISTERED_DEVICES.length === 0) {
+    console.warn('⚠️ No devices found in config/devices.js to seed.');
+    return;
   }
 
-  if (created > 0 || skipped > 0) {
-    console.log(`📦 Seed complete — created: ${created}, skipped: ${skipped}`);
+  console.log(`🚀 Preparing bulk seed for ${REGISTERED_DEVICES.length} devices...`);
+
+  const ops = REGISTERED_DEVICES.map(d => ({
+    updateOne: {
+      filter: { imei: d.imei },
+      update: {
+        // $setOnInsert only runs when a NEW device is created (upsert)
+        // Never overwrites live telemetry on existing devices
+        $setOnInsert: {
+          vehicleReg:  d.vehicleReg.toUpperCase(),
+          name:        d.name,
+          type:        d.type     || 'car',
+          protocol:    d.protocol || 'WanWay',
+          pocName:     d.pocName  || '',
+          pocContact:  d.pocContact || '',
+          // ✅ No Delhi defaults — null means "not yet received from device"
+          // IOPGPS will populate real coords on the first poll
+          latitude:    null,
+          longitude:   null,
+          status:      'offline',
+          isOnline:    false,
+          isLive:      false,
+          lastUpdate:  new Date(),
+        }
+      },
+      upsert: true
+    }
+  }));
+
+  try {
+    const result = await Vehicle.bulkWrite(ops, { ordered: false });
+
+    console.log('--- 📦 Bulk Seed Summary ---');
+    console.log(` ✅ Matched:  ${result.matchedCount}`);
+    console.log(` ✅ Upserted: ${result.upsertedCount} (New devices added)`);
+    console.log(` ✅ Modified: ${result.modifiedCount} (Existing devices updated)`);
+    console.log('---------------------------');
+  } catch (e) {
+    console.error('❌ Bulk seed failed:', e.message);
   }
 }
 
-// Allow running directly: node scripts/seedDevices.js
+// Support for direct execution
 if (require.main === module) {
   require('dotenv').config();
   const connectDB = require('../config/db');
+
   connectDB()
     .then(seedDevices)
-    .then(() => process.exit(0))
-    .catch(e => { console.error(e.message); process.exit(1); });
+    .then(() => {
+      console.log('🏁 Seeding process finished.');
+      process.exit(0);
+    })
+    .catch(e => {
+      console.error(`💥 Fatal Error: ${e.message}`);
+      process.exit(1);
+    });
 }
 
 module.exports = seedDevices;

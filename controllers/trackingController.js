@@ -1,43 +1,208 @@
-// controllers/trackingController.js
 'use strict';
 
-const Vehicle      = require('../models/Vehicle');
+const Vehicle = require('../models/Vehicle');
 const LocationPing = require('../models/LocationPing');
-const geolib       = require('geolib');
-const GPSEngine    = require('../services/gps.engine');
-
-// ── In-memory vehicle state cache — O(1) reads for 1000+ vehicles ─────────────
-// Populated by GPS server; used by getLiveVehicles for zero-DB-latency response
-if (!global.vehicleStates) global.vehicleStates = {};
+const geolib = require('geolib');
+const GPSEngine = require('./geofenceController');
+const logger = require('../utils/logger');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/tracking  — all live / recently active vehicles
-// Flutter: ApiService.fetchLiveVehicles()
+// GET /api/tracking — Fetch live fleet status for Flutter Map
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getLiveVehicles = async (req, res) => {
   try {
-    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    // ✅ FIX 1: Removed the 12-hour activeThreshold filter.
+    // Offline vehicles must still appear on the map using lastKnownLocation.
+    // The old filter was silently dropping any device offline > 12h.
+    const vehicles = await Vehicle.find({})
+      .select([
+        'name', 'vehicleReg', 'type', 'imei',
+        'latitude', 'longitude', 'speed', 'heading', 'status',
+        'isOnline', 'isLive', 'gpsSignal', 'location',
+        'lastUpdate', 'lastOnlineAt',   // ✅ FIX 2: was missing
+        'lastKnownLocation',             // ✅ FIX 3: was missing — this is what the map needs for offline vehicles
+        'pocName', 'pocContact',
+        'fuel', 'batteryLevel',
+        'analytics',
+      ].join(' '))
+      .limit(2000)
+      .lean();
 
-    const vehicles = await Vehicle.find({
-      $or: [{ isOnline: true }, { lastUpdate: { $gte: fiveMinutesAgo } }],
-    }).sort({ lastUpdate: -1 }).limit(200).lean();
+    const data = vehicles.map(v => {
+      // ✅ FIX 4: For offline vehicles, use lastKnownLocation coords if live coords are default/missing.
+      // This is why Rajasthan coords weren't showing — the map was getting
+      // the schema defaults (Delhi: 28.6139, 77.2090) not the IOP GPS coords.
+      const lkl = v.lastKnownLocation;
+      const hasLiveCoords = v.latitude && v.longitude &&
+                            !(v.latitude === 28.6139 && v.longitude === 77.2090);
 
-    const data = vehicles.map(v => ({
-      ...v,
-      id:           v._id.toString(),
-      lat:          v.latitude,
-      lng:          v.longitude,
-      speed:        Number(v.speed)        || 0,
-      fuel:         Number(v.fuel)         || 0,
-      batteryLevel: Number(v.batteryLevel) || 0,
-      heading:      Number(v.heading)      || 0,
-      driverName:   v.pocName,
-      driverPhone:  v.pocContact,
-      timestamp:    v.lastUpdate,
-      gps:          v.gpsSignal,
-    }));
+      const lat = hasLiveCoords ? v.latitude  : lkl?.latitude;
+      const lng = hasLiveCoords ? v.longitude : lkl?.longitude;
+
+      // ✅ FIX 5: Compute offlineDuration here so Flutter gets a ready-to-display string
+      let offlineDuration = null;
+      if (!v.isOnline && v.lastOnlineAt) {
+        const ms           = Date.now() - new Date(v.lastOnlineAt).getTime();
+        const totalMinutes = Math.floor(ms / 60000);
+        const days         = Math.floor(totalMinutes / 1440);
+        const hours        = Math.floor((totalMinutes % 1440) / 60);
+        const minutes      = totalMinutes % 60;
+        offlineDuration    = days > 0
+          ? `${days}d ${hours}h`
+          : hours > 0
+            ? `${hours}h ${minutes}m`
+            : `${minutes}m`;
+      }
+
+      return {
+        id:               v._id.toString(),
+        name:             v.name,
+        vehicleReg:       v.vehicleReg,
+        type:             v.type,
+        imei:             v.imei,
+
+        // Live coords (may be defaults if device never moved while online)
+        latitude:         v.latitude,
+        longitude:        v.longitude,
+
+        // ✅ Best coords for map marker — Rajasthan will show correctly now
+        lat,
+        lng,
+
+        speed:            v.speed,
+        heading:          v.heading,
+        status:           v.status,
+        isOnline:         v.isOnline,
+        isLive:           v.isLive,
+        gpsSignal:        v.gpsSignal,
+        location:         v.location,
+        lastUpdate:       v.lastUpdate,
+        lastOnlineAt:     v.lastOnlineAt,
+        offlineDuration,              // pre-formatted: "3d 19h", "45m", null
+        lastKnownLocation: lkl,       // full subdocument for vehicle detail screen
+        pocName:          v.pocName,
+        pocContact:       v.pocContact,
+        fuel:             v.fuel,
+        batteryLevel:     v.batteryLevel,
+        analytics:        v.analytics,
+        timestamp:        v.lastUpdate,
+      };
+    });
 
     res.json({ success: true, count: data.length, data });
+  } catch (error) {
+    logger.error(`getLiveVehicles error: ${error.message}`);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/tracking/batch-update (WanWay API Inbound)
+// ─────────────────────────────────────────────────────────────────────────────
+exports.batchUpdate = async (req, res) => {
+  try {
+    const { updates } = req.body;
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({ success: false, message: 'updates[] array is required' });
+    }
+
+    const bulkOps = [];
+    const now = new Date();
+
+    for (const u of updates) {
+      if (!u.imei) continue;
+
+      const isOnline     = u.isOnline !== undefined ? u.isOnline : true;
+      const hasValidGPS  = u.latitude && u.longitude &&
+                           !(u.latitude === 0 && u.longitude === 0);
+
+      const baseSet = {
+        latitude:      u.latitude,
+        longitude:     u.longitude,
+        speed:         u.speed    || 0,
+        heading:       u.heading  || u.course || 0,
+        status:        u.speed > 2 ? 'moving' : 'static',
+        isOnline,
+        lastUpdate:    u.timestamp ? new Date(u.timestamp) : now,
+        lastWanWaySync: now,
+      };
+
+      // Only snapshot lastKnownLocation when online + valid GPS
+      if (isOnline && hasValidGPS) {
+        baseSet.lastKnownLocation = {
+          latitude:  u.latitude,
+          longitude: u.longitude,
+          speed:     u.speed    || 0,
+          heading:   u.heading  || u.course || 0,
+          voltage:   u.voltage  ?? null,
+          odometer:  u.odometer ?? null,
+          timestamp: u.timestamp ? new Date(u.timestamp) : now,
+        };
+        baseSet.lastOnlineAt = u.timestamp ? new Date(u.timestamp) : now;
+      }
+
+      bulkOps.push({
+        updateOne: {
+          filter: { imei: u.imei },
+          update: { $set: baseSet },
+        }
+      });
+    }
+
+    if (bulkOps.length > 0) {
+      await Vehicle.bulkWrite(bulkOps, { ordered: false });
+
+      const updatedVehicles = await Vehicle.find({
+        imei: { $in: updates.map(u => u.imei) }
+      }).lean();
+
+      for (const vehicle of updatedVehicles) {
+        GPSEngine.checkGeofences(vehicle).catch(e =>
+          logger.error(`Geofence Error [${vehicle.imei}]: ${e.message}`)
+        );
+
+        if (global.io) {
+          global.io.emit('vehicleMovement', {
+            id:           vehicle._id.toString(),
+            imei:         vehicle.imei,
+            lat:          vehicle.latitude,
+            lng:          vehicle.longitude,
+            speed:        vehicle.speed,
+            status:       vehicle.status,
+            heading:      vehicle.heading,
+            isOnline:     vehicle.isOnline,
+            lastUpdate:   vehicle.lastUpdate,
+            lastOnlineAt: vehicle.lastOnlineAt,
+          });
+        }
+      }
+    }
+
+    res.json({ success: true, message: `Processed ${bulkOps.length} updates` });
+  } catch (error) {
+    logger.error(`Batch Update Failed: ${error.message}`);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/tracking/:id/history
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getVehicleHistory = async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    const query = { vehicleId: req.params.id };
+
+    if (start && end) {
+      query.timestamp = { $gte: new Date(start), $lte: new Date(end) };
+    }
+
+    const history = await LocationPing.find(query)
+      .sort({ timestamp: 1 })
+      .limit(2000)
+      .lean();
+
+    res.json({ success: true, count: history.length, data: history });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -46,284 +211,11 @@ exports.getLiveVehicles = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/tracking/:id
 // ─────────────────────────────────────────────────────────────────────────────
-exports.getVehicleTracking = async (req, res) => {
+exports.getVehicleById = async (req, res) => {
   try {
     const vehicle = await Vehicle.findById(req.params.id).lean();
     if (!vehicle) return res.status(404).json({ success: false, message: 'Vehicle not found' });
-
-    const formatted = {
-      ...vehicle,
-      id:  vehicle._id.toString(),
-      lat: vehicle.latitude,
-      lng: vehicle.longitude,
-      speed:        Number(vehicle.speed)        || 0,
-      fuel:         Number(vehicle.fuel)         || 0,
-      batteryLevel: Number(vehicle.batteryLevel) || 0,
-      heading:      Number(vehicle.heading)      || 0,
-      driverName:   vehicle.pocName,
-      driverPhone:  vehicle.pocContact,
-      timestamp:    vehicle.lastUpdate,
-      gps:          vehicle.gpsSignal,
-    };
-
-    res.json({ success: true, data: formatted });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/tracking/update
-// HTTP GPS update endpoint (fallback when TCP is unavailable)
-// ─────────────────────────────────────────────────────────────────────────────
-exports.updatePosition = async (req, res) => {
-  try {
-    const {
-      vehicleReg, latitude, longitude, speed, heading,
-      fuel, batteryLevel, status, gpsSignal, timestamp,
-      altitude, location,
-    } = req.body;
-
-    if (!vehicleReg) {
-      return res.status(400).json({ success: false, message: 'vehicleReg is required' });
-    }
-
-    // Upsert vehicle
-    let vehicle = await Vehicle.findOneAndUpdate(
-      { vehicleReg },
-      {
-        $set: {
-          latitude:     latitude     ?? 0,
-          longitude:    longitude    ?? 0,
-          altitude:     altitude     ?? 0,
-          speed:        speed        ?? 0,
-          heading:      heading      ?? 0,
-          fuel:         fuel         ?? undefined,
-          batteryLevel: batteryLevel ?? undefined,
-          gpsSignal:    gpsSignal    ?? true,
-          status:       status       || (speed > 5 ? 'moving' : 'idle'),
-          isLive:   true,
-          isOnline: true,
-          location: location || undefined,
-          lastUpdate: timestamp ? new Date(timestamp) : new Date(),
-        },
-      },
-      { new: true, upsert: false }  // don't create via HTTP — use registerVehicle instead
-    );
-
-    if (!vehicle) {
-      return res.status(404).json({ success: false, message: 'Vehicle not found — register it first via POST /api/vehicles' });
-    }
-
-    // Update in-memory cache
-    global.vehicleStates[vehicleReg] = {
-      lat: vehicle.latitude, lng: vehicle.longitude,
-      speed: vehicle.speed, heading: vehicle.heading,
-      status: vehicle.status, lastUpdate: vehicle.lastUpdate,
-    };
-
-    // Persist ping (async — don't await, keeps response fast)
-    LocationPing.create({
-      vehicleId:    vehicle._id,
-      latitude:     vehicle.latitude,
-      longitude:    vehicle.longitude,
-      altitude:     altitude ?? 0,
-      speed:        vehicle.speed,
-      heading:      vehicle.heading,
-      fuel:         vehicle.fuel,
-      batteryLevel: vehicle.batteryLevel,
-      status:       vehicle.status,
-      gpsSignal:    vehicle.gpsSignal,
-      timestamp:    vehicle.lastUpdate,
-    }).catch(err => console.error('LocationPing save error:', err.message));
-
-    // Run alert engine (async)
-    GPSEngine.processUpdate(vehicle).catch(err => console.error('GPS engine error:', err.message));
-
-    // Emit via socket
-    if (req.io) {
-      req.io.emit('vehicleMovement', {
-        vehicleId:  vehicle._id.toString(),
-        id:         vehicle._id.toString(),
-        vehicleReg: vehicle.vehicleReg,
-        lat:        vehicle.latitude,
-        lng:        vehicle.longitude,
-        speed:      vehicle.speed,
-        heading:    vehicle.heading,
-        status:     vehicle.status,
-        isLive:     true,
-        gpsSignal:  vehicle.gpsSignal,
-        lastUpdate: vehicle.lastUpdate.toISOString(),
-        location:   vehicle.location,
-      });
-    }
-
-    res.json({ success: true, message: 'Position updated', vehicleId: vehicle._id });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/tracking/:id/history
-// ─────────────────────────────────────────────────────────────────────────────
-exports.getHistory = async (req, res) => {
-  try {
-    const { days = 7, limit = 500 } = req.query;
-    const startDate = new Date(Date.now() - parseInt(days) * 24 * 60 * 60 * 1000);
-
-    const pings = await LocationPing.find({
-      vehicleId: req.params.id,
-      timestamp: { $gte: startDate },
-    }).sort({ timestamp: 1 }).limit(parseInt(limit)).lean();
-
-    if (pings.length === 0) {
-      return res.json({ success: true, data: {
-        totalDistance: 0, totalTrips: 0, avgSpeed: 0, maxSpeed: 0,
-        movingTime: 0, idleTime: 0, stops: [], pings: [],
-        period: { start: startDate.toISOString(), end: new Date().toISOString() },
-      }});
-    }
-
-    let totalDistance = 0, totalSpeed = 0, speedCount = 0, maxSpeed = 0;
-    let movingTime = 0, idleTime = 0;
-    const stops = [];
-
-    for (let i = 1; i < pings.length; i++) {
-      const prev = pings[i - 1], curr = pings[i];
-      totalDistance += geolib.getDistance(
-        { latitude: prev.latitude, longitude: prev.longitude },
-        { latitude: curr.latitude, longitude: curr.longitude }
-      );
-      if (curr.speed > 0) { totalSpeed += curr.speed; speedCount++; }
-      if (curr.speed > maxSpeed) maxSpeed = curr.speed;
-
-      const timeDiffMin = (curr.timestamp - prev.timestamp) / (1000 * 60);
-      if (curr.speed > 5) {
-        movingTime += timeDiffMin;
-      } else {
-        idleTime += timeDiffMin;
-        // Record stop if idle > 5 min and not already nearby
-        if (timeDiffMin > 5) {
-          const alreadyRecorded = stops.some(s =>
-            geolib.getDistance(
-              { latitude: s.latitude, longitude: s.longitude },
-              { latitude: curr.latitude, longitude: curr.longitude }
-            ) < 50
-          );
-          if (!alreadyRecorded) {
-            stops.push({
-              latitude:  curr.latitude,
-              longitude: curr.longitude,
-              startTime: prev.timestamp,
-              duration:  timeDiffMin,
-            });
-          }
-        }
-      }
-    }
-
-    res.json({ success: true, data: {
-      totalDistance: (totalDistance / 1000).toFixed(2),
-      totalTrips:    0,
-      avgSpeed:      speedCount > 0 ? (totalSpeed / speedCount).toFixed(1) : 0,
-      maxSpeed:      maxSpeed.toFixed(1),
-      movingTime:    movingTime.toFixed(0),
-      idleTime:      idleTime.toFixed(0),
-      stops:         stops.slice(0, 20),
-      pings:         pings.map(p => ({
-        timestamp: p.timestamp, lat: p.latitude, lng: p.longitude,
-        speed: p.speed, heading: p.heading, status: p.status,
-      })),
-      period: {
-        start: pings[0].timestamp.toISOString(),
-        end:   pings[pings.length - 1].timestamp.toISOString(),
-      },
-    }});
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/tracking/batch-update
-// ─────────────────────────────────────────────────────────────────────────────
-exports.batchUpdate = async (req, res) => {
-  try {
-    const updates = req.body.updates;
-    if (!Array.isArray(updates) || updates.length === 0) {
-      return res.status(400).json({ success: false, message: 'updates[] is required' });
-    }
-
-    // Build bulk ops — single DB round trip for all vehicles
-    const bulkOps = [];
-    const pingDocs = [];
-
-    for (const u of updates) {
-      if (!u.vehicleReg) continue;
-      const ts     = u.timestamp ? new Date(u.timestamp) : new Date();
-      const status = u.status || (u.speed > 5 ? 'moving' : 'idle');
-
-      bulkOps.push({
-        updateOne: {
-          filter: { vehicleReg: u.vehicleReg },
-          update: {
-            $set: {
-              latitude:  u.latitude,  longitude: u.longitude,
-              speed:     u.speed,     heading:   u.heading,
-              status, isLive: true, isOnline: true, lastUpdate: ts,
-            },
-          },
-        },
-      });
-
-      pingDocs.push({
-        vehicleId: null,   // will be filled below after bulk write
-        vehicleReg: u.vehicleReg,
-        latitude: u.latitude, longitude: u.longitude,
-        speed: u.speed, heading: u.heading,
-        status, timestamp: ts,
-      });
-    }
-
-    if (bulkOps.length === 0) {
-      return res.json({ success: true, message: 'No valid updates', data: [] });
-    }
-
-    await Vehicle.bulkWrite(bulkOps, { ordered: false });
-
-    // Fetch updated vehicles to get their _ids for pings and socket emit
-    const regs     = updates.map(u => u.vehicleReg).filter(Boolean);
-    const vehicles = await Vehicle.find({ vehicleReg: { $in: regs } }, '_id vehicleReg latitude longitude speed heading status').lean();
-    const idMap    = new Map(vehicles.map(v => [v.vehicleReg, v]));
-
-    const pingsToInsert = pingDocs
-      .map(p => {
-        const v = idMap.get(p.vehicleReg);
-        if (!v) return null;
-        return { vehicleId: v._id, latitude: p.latitude, longitude: p.longitude, speed: p.speed, heading: p.heading, status: p.status, timestamp: p.timestamp };
-      })
-      .filter(Boolean);
-
-    if (pingsToInsert.length > 0) {
-      LocationPing.insertMany(pingsToInsert, { ordered: false })
-        .catch(err => console.error('Batch ping insert error:', err.message));
-    }
-
-    // Emit socket events
-    if (req.io) {
-      for (const v of vehicles) {
-        req.io.emit('vehicleMovement', {
-          vehicleId: v._id.toString(), vehicleReg: v.vehicleReg,
-          lat: v.latitude, lng: v.longitude,
-          speed: v.speed, heading: v.heading,
-          status: v.status, isLive: true,
-          lastUpdate: new Date().toISOString(),
-        });
-      }
-    }
-
-    res.json({ success: true, message: `Processed ${bulkOps.length} updates`, data: vehicles.map(v => ({ vehicleReg: v.vehicleReg, success: true })) });
+    res.json({ success: true, data: vehicle });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
