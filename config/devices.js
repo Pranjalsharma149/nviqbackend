@@ -3,32 +3,75 @@
 /**
  * REGISTERED_DEVICES
  * Single Source of Truth for fleet configuration.
- * * Scalability Note: While this array works great for hundreds of devices,
- * for 20k+ devices, you will eventually want to move this registry
- * entirely into a MongoDB collection with an Index on IMEI.
+ *
+ * Protocols:
+ *   PT06      → connects via IOP GPS (WanWay platform) — polled every 30s
+ *   GT06      → connects directly via TCP port 5001
+ *
+ * Scalability Note: For 20k+ devices, move this registry into MongoDB
+ * with an index on IMEI.
  */
 const REGISTERED_DEVICES = [
+
+  // ── IOP GPS Platform Devices (WanWay) ──────────────────────────────────────
   {
-    imei:         '356218606576971',   // Primary Key — Vehicle Tracker 1 (PT06)
+    imei:         '356218606576971',
     vehicleReg:   'HR26AB1234',
     name:         'Vehicle Tracker 1',
-    type:         'car',               // Used for Flutter map icons
-    protocol:     'PT06',              // ← Updated from GT06 to PT06 (confirmed from IOP GPS portal)
+    type:         'car',
+    protocol:     'PT06',              // Via IOP GPS platform
     pocName:      'John Doe',
     pocContact:   '+919999999999',
-    speedLimit:   80,                  // Engine triggers alert > 80 km/h
-    fuelAlert:    15,                  // Alert when fuel < 15%
-    battAlert:    20,                  // Alert when battery < 20%
+    speedLimit:   80,
+    fuelAlert:    15,
+    battAlert:    20,
   },
-  // Add more devices below...
+  {
+    imei:         '868720064616620',
+    vehicleReg:   'DEVICE2',           // ← Replace with real plate number
+    name:         'Vehicle Tracker 2',
+    type:         'car',               // ← Update if truck/bike
+    protocol:     'PT06',              // Via IOP GPS platform
+    pocName:      '',
+    pocContact:   '',
+    speedLimit:   80,
+    fuelAlert:    15,
+    battAlert:    20,
+    sim:          '89911025034030798906',
+  },
+
+  // ── Direct TCP Devices (GT06 protocol → port 5001) ─────────────────────────
+  {
+    imei:         '866221070653410',
+    vehicleReg:   'DEVICE3',           // ← Replace with real plate number
+    name:         'Vehicle Tracker 3',
+    type:         'car',               // ← Update if truck/bike
+    protocol:     'GT06',              // Direct TCP — PRIME09
+    pocName:      '',
+    pocContact:   '',
+    speedLimit:   80,
+    fuelAlert:    15,
+    battAlert:    20,
+  },
+  {
+    imei:         '867010072155188',
+    vehicleReg:   'DEVICE4',           // ← Replace with real plate number
+    name:         'Vehicle Tracker 4',
+    type:         'car',               // ← Update if truck/bike
+    protocol:     'GT06',              // Direct TCP — VL149
+    pocName:      '',
+    pocContact:   '',
+    speedLimit:   80,
+    fuelAlert:    15,
+    battAlert:    20,
+  },
+
 ];
 
-// ── OPTIMIZED LOOKUPS ────────────────────────────────────────────────────────
-// Using Maps ensures O(1) lookup time even as the list grows to thousands.
+// ── OPTIMIZED LOOKUPS ─────────────────────────────────────────────────────────
 const BY_IMEI = new Map();
 const BY_REG  = new Map();
 
-// Initialize maps once at startup
 REGISTERED_DEVICES.forEach(device => {
   if (device.imei)       BY_IMEI.set(String(device.imei), device);
   if (device.vehicleReg) BY_REG.set(String(device.vehicleReg), device);
@@ -37,61 +80,44 @@ REGISTERED_DEVICES.forEach(device => {
 module.exports = {
   REGISTERED_DEVICES,
 
-  /**
-   * getByIMEI
-   * Used by GPS TCP server to identify incoming packets
-   */
-  getByIMEI: (imei) => {
-    if (!imei) return null;
-    return BY_IMEI.get(String(imei)) || null;
-  },
-
-  /**
-   * getByReg
-   * Used by API to find vehicle by plate number
-   */
-  getByReg: (reg) => {
-    if (!reg) return null;
-    return BY_REG.get(String(reg)) || null;
-  },
-
-  /**
-   * isKnownDevice
-   * Quick boolean check to drop unauthorized traffic early
-   */
+  getByIMEI:     (imei) => BY_IMEI.get(String(imei)) || null,
+  getByReg:      (reg)  => BY_REG.get(String(reg))   || null,
   isKnownDevice: (imei) => BY_IMEI.has(String(imei)),
+  getAllIMEIs:   ()      => Array.from(BY_IMEI.keys()),
 
-  getAllIMEIs: () => Array.from(BY_IMEI.keys()),
+  // Returns only IMEIs that use the IOP GPS platform (polled via WanWay)
+  getIopIMEIs: () => REGISTERED_DEVICES
+    .filter(d => d.protocol === 'PT06')
+    .map(d => d.imei),
+
+  // Returns only IMEIs that connect directly via TCP
+  getTcpIMEIs: () => REGISTERED_DEVICES
+    .filter(d => d.protocol === 'GT06')
+    .map(d => d.imei),
 };
 
 /**
- * 💡 OPERATIONAL NOTES (PT06)
  * ─────────────────────────────────────────────────────────────────────────────
- * To configure the physical PT06 tracker, send SMS commands to the SIM number
- * inside the device (9876543210):
+ * DEVICE SUMMARY
+ * ─────────────────────────────────────────────────────────────────────────────
  *
- * 1. SET SERVER IP & PORT:
- *    SMS: "SERVER,0,[YOUR_PUBLIC_IP],5001,0#"
- *    Example: "SERVER,0,171.61.17.205,5001,0#"
- *
- * 2. SET APN (use your SIM provider's APN):
- *    SMS: "APN,[APN_NAME]#"
- *    Example for Jio: "APN,jionet#"
- *    Example for Airtel: "APN,airtelgprs.com#"
- *
- * 3. SET REPORTING INTERVAL:
- *    SMS: "TIMER,10,60#"  (10s when moving, 60s when stationary)
- *
- * 4. SET TIMEZONE TO UTC:
- *    SMS: "GMT,E,0,0#"
- *
- * 5. CHECK STATUS:
- *    SMS: "STATUS#"  — device replies with current config
+ * Device 1 — PT06      | IMEI: 356218606576971 | Via WanWay IOP GPS
+ * Device 2 — PT06 lite | IMEI: 868720064616620 | Via WanWay IOP GPS
+ * Device 3 — PRIME09   | IMEI: 866221070653410 | Direct TCP port 5001
+ * Device 4 — VL149     | IMEI: 867010072155188 | Direct TCP port 5001
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * IMPORTANT: Your server must be publicly accessible on port 5001.
- * If running locally, use a tool like ngrok:
- *   ngrok tcp 5001
- * Then use the ngrok IP/port in the SERVER SMS command above.
+ * CONFIGURING DIRECT TCP DEVICES (PRIME09 & VL149)
+ * Send these SMS commands to each device's SIM card number:
+ *
+ * 1. SET SERVER:   SERVER,0,[YOUR_SERVER_IP],5001,0#
+ * 2. SET APN:      APN,airtelgprs.com#
+ * 3. SET INTERVAL: TIMER,10,60#
+ * 4. SET TIMEZONE: GMT,E,0,0#
+ * 5. CHECK STATUS: STATUS#
+ *
+ * ⚠️  IMPORTANT: Render.com does NOT support TCP port 5001.
+ *     For direct TCP devices you need a VPS (DigitalOcean/AWS)
+ *     with port 5001 open, OR register them on WanWay platform instead.
  * ─────────────────────────────────────────────────────────────────────────────
  */
