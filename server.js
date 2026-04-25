@@ -75,8 +75,11 @@ async function boot() {
   app.use('/api/tracking',  require('./routes/tracking.routes'));
   app.use('/api/alerts',    require('./routes/alerts.routes'));
   app.use('/api/analytics', require('./routes/analytics.routes'));
-  app.use('/api/support', require('./routes/support.routes'));
+  app.use('/api/support',   require('./routes/support.routes'));
   app.use('/api/geofences', require('./routes/geofence.routes'));
+
+  // ✅ NEW: Trip routes (history + analytics hub)
+  app.use('/api/trips',     require('./routes/trip.routes'));
 
   // ── Socket Connection Logic ─────────────────────────────────────────────────
   io.on('connection', (socket) => {
@@ -95,7 +98,6 @@ async function boot() {
   // A. TCP GPS Server (GT06/Hardware devices)
   const GPS_PORT = process.env.GPS_TCP_PORT || 5001;
   require('./services/gps.server').startGpsServer(GPS_PORT);
-  // ↑ This already logs "📡 GPS TCP Receiver online on port 5001" internally
 
   // B. WanWay Cloud Poller
   wanwayPoller.start();
@@ -104,7 +106,6 @@ async function boot() {
   const PORT = process.env.PORT || 5000;
   server.listen(PORT, '0.0.0.0', () => {
     logger.info('🚀 NVIQ Fleet Server online on port %d', PORT);
-    // ✅ REMOVED: duplicate GPS TCP log that was here before
   });
 }
 
