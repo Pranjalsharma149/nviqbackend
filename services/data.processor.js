@@ -3,25 +3,6 @@
 const logger = require('../utils/logger');
 
 // ── GCJ-02 → WGS-84 coordinate converter ─────────────────────────────────────
-//
-// WHY THIS IS NEEDED:
-//   wanwaygps.com (IOP GPS) is a Chinese platform. It returns ALL coordinates
-//   in GCJ-02 format (China's encrypted "Mars Coordinates") regardless of
-//   where the physical device is located — including India.
-//
-//   Google Maps and Flutter expect WGS-84 (standard GPS).
-//   Without this conversion the map marker is offset by ~484 metres.
-//
-// PROOF (from actual log data lat=27.386688, lng=76.662071):
-//   Raw IOP (GCJ-02) : lat=27.386688, lng=76.662071
-//   Converted (WGS-84): lat=27.390493, lng=76.659688
-//   Offset            : 484 metres
-//
-//   Raw (wrong):      https://maps.google.com/?q=27.386688,76.662071
-//   Converted (real): https://maps.google.com/?q=27.390493,76.659688
-//
-// DO NOT REMOVE THIS CONVERSION.
-// ─────────────────────────────────────────────────────────────────────────────
 function gcj02ToWgs84(gcjLng, gcjLat) {
   const a  = 6378245.0;
   const ee = 0.00669342162296594323;
@@ -54,77 +35,69 @@ function gcj02ToWgs84(gcjLng, gcjLat) {
     lng: gcjLng - (dLng * 180) / (a / sqrtMagic * Math.cos(radLat) * Math.PI),
   };
 }
-// ─────────────────────────────────────────────────────────────────────────────
 
+// ── Reverse geocode using Nominatim (free, no API key) ───────────────────────
+// Only called when IOPGPS doesn't supply an address string.
+// Results are cached in _geocodeCache to avoid hammering Nominatim.
+const _geocodeCache = new Map();   // "lat5,lng5" → address string
+
+async function _reverseGeocode(lat, lng) {
+  const key = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+  if (_geocodeCache.has(key)) return _geocodeCache.get(key);
+
+  try {
+    const axios = require('axios');
+    const res   = await axios.get(
+      'https://nominatim.openstreetmap.org/reverse',
+      {
+        params: { lat, lon: lng, format: 'json', zoom: 18 },
+        headers: { 'User-Agent': 'NVIQFleetServer/1.0' },
+        timeout: 5000,
+      }
+    );
+    const addr = res.data?.display_name ?? null;
+    if (addr) _geocodeCache.set(key, addr);
+    return addr;
+  } catch (_) {
+    return null;
+  }
+}
 
 // ── Trip auto-detection state ─────────────────────────────────────────────────
-//
-// We keep an in-memory map of:  imei → { tripId, startSpeed, lastMovingAt }
-//
-// Rules:
-//   • Vehicle transitions from idle/stopped → speed > 5 km/h
-//     → create a new Trip document (if none open already)
-//
-//   • Vehicle transitions from moving → speed ≤ 5 km/h  AND
-//     stays stopped for IDLE_GRACE_MS (default 3 minutes)
-//     → end the open Trip, save stats
-//
-// The grace period prevents micro-stops (traffic lights, junctions)
-// from splitting one journey into many small trips.
-// ─────────────────────────────────────────────────────────────────────────────
-const IDLE_GRACE_MS   = 3 * 60 * 1000;   // 3 minutes of stillness before ending trip
-const MOVING_SPEED_KMH = 5;              // km/h threshold
+const IDLE_GRACE_MS    = 3 * 60 * 1000;
+const MOVING_SPEED_KMH = 5;
 
-// imei → { tripId: ObjectId|string, idleSince: Date|null, lastLat, lastLng, maxSpeed, totalDistance, speedReadings }
 const _tripState = new Map();
 
-/**
- * Auto-detect trip start/end for one vehicle.
- * Called after the vehicle document has already been written to MongoDB.
- */
 async function _handleTripDetection({
-  vehicleId,    // Mongo ObjectId (from DB lookup)
-  imei,
-  isOnline,
-  speed,        // km/h — already parsed
-  lat,          // WGS-84
-  lng,
-  timestamp,
-  hasValidGPS,
+  vehicleId, imei, isOnline, speed, lat, lng, timestamp, hasValidGPS,
 }) {
   if (!vehicleId || !isOnline || !hasValidGPS) return;
 
   const Trip = require('../models/Trip');
 
-  const isMoving  = speed > MOVING_SPEED_KMH;
-  const stateKey  = imei;
-  const prev      = _tripState.get(stateKey) || {
-    tripId:        null,
-    idleSince:     null,
-    lastLat:       null,
-    lastLng:       null,
-    maxSpeed:      0,
-    totalDistance: 0,
-    speedReadings: [],
+  const isMoving = speed > MOVING_SPEED_KMH;
+  const stateKey = imei;
+  const prev     = _tripState.get(stateKey) || {
+    tripId: null, idleSince: null,
+    lastLat: null, lastLng: null,
+    maxSpeed: 0, totalDistance: 0, speedReadings: [],
   };
 
-  // ── Distance calculation (Haversine, km) ───────────────────────────────────
   function haversine(lat1, lng1, lat2, lng2) {
     const R  = 6371;
     const dL = (lat2 - lat1) * Math.PI / 180;
     const dG = (lng2 - lng1) * Math.PI / 180;
     const a  =
-      Math.sin(dL / 2) * Math.sin(dL / 2) +
-      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-      Math.sin(dG / 2) * Math.sin(dG / 2);
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      Math.sin(dL/2) * Math.sin(dL/2) +
+      Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) *
+      Math.sin(dG/2) * Math.sin(dG/2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
 
-  // Accumulate distance between consecutive GPS pings
   let segmentKm = 0;
   if (prev.lastLat != null && prev.lastLng != null && isMoving) {
     segmentKm = haversine(prev.lastLat, prev.lastLng, lat, lng);
-    // Sanity cap: ignore jumps > 5 km per poll (GPS glitch / tunnel exit)
     if (segmentKm > 5) segmentKm = 0;
   }
 
@@ -134,11 +107,8 @@ async function _handleTripDetection({
     ? [...prev.speedReadings, speed]
     : prev.speedReadings;
 
-  // ── CASE 1: Vehicle is MOVING ──────────────────────────────────────────────
   if (isMoving) {
     let tripId = prev.tripId;
-
-    // No open trip → create one
     if (!tripId) {
       try {
         const trip = await Trip.create({
@@ -150,8 +120,6 @@ async function _handleTripDetection({
         });
         tripId = trip._id;
         logger.info('🚗 Trip STARTED | imei=%s | tripId=%s', imei, tripId);
-
-        // Notify Flutter via socket
         if (global.io) {
           global.io.emit('trip_started', {
             tripId:    tripId.toString(),
@@ -163,62 +131,39 @@ async function _handleTripDetection({
         logger.error('❌ createTrip error for imei=%s: %s', imei, err.message);
       }
     }
-
-    // Reset idle timer because vehicle is moving
     _tripState.set(stateKey, {
-      tripId,
-      idleSince:     null,
-      lastLat:       lat,
-      lastLng:       lng,
-      maxSpeed:      newMaxSpeed,
-      totalDistance: newTotalDistance,
+      tripId, idleSince: null,
+      lastLat: lat, lastLng: lng,
+      maxSpeed: newMaxSpeed, totalDistance: newTotalDistance,
       speedReadings: newSpeedReadings,
     });
     return;
   }
 
-  // ── CASE 2: Vehicle is STOPPED / IDLE ─────────────────────────────────────
   const idleSince = prev.idleSince ?? new Date();
-
-  // No open trip — nothing to end, just track idle start
   if (!prev.tripId) {
-    _tripState.set(stateKey, {
-      ...prev,
-      idleSince,
-      lastLat: lat,
-      lastLng: lng,
-    });
+    _tripState.set(stateKey, { ...prev, idleSince, lastLat: lat, lastLng: lng });
     return;
   }
 
-  // Has open trip but just stopped — start/continue grace period
   const idleMs = Date.now() - idleSince.getTime();
-
   if (idleMs < IDLE_GRACE_MS) {
-    // Within grace period — update idle start but keep trip open
     _tripState.set(stateKey, {
-      ...prev,
-      idleSince,
-      lastLat:       lat,
-      lastLng:       lng,
-      maxSpeed:      newMaxSpeed,
-      totalDistance: newTotalDistance,
+      ...prev, idleSince, lastLat: lat, lastLng: lng,
+      maxSpeed: newMaxSpeed, totalDistance: newTotalDistance,
       speedReadings: newSpeedReadings,
     });
     return;
   }
 
-  // ── Grace period EXPIRED → END the trip ───────────────────────────────────
   try {
-    const avgSpeed = prev.speedReadings.length > 0
+    const avgSpeed  = prev.speedReadings.length > 0
       ? prev.speedReadings.reduce((a, b) => a + b, 0) / prev.speedReadings.length
       : 0;
-
-    const openTrip = await Trip.findById(prev.tripId);
+    const openTrip  = await Trip.findById(prev.tripId);
     if (openTrip && !openTrip.isCompleted) {
       const endTime  = timestamp;
-      const duration = Math.round((endTime - openTrip.startTime) / 60000); // minutes
-
+      const duration = Math.round((endTime - openTrip.startTime) / 60000);
       openTrip.endTime       = endTime;
       openTrip.duration      = Math.max(0, duration);
       openTrip.endLocation   = { latitude: lat, longitude: lng };
@@ -226,14 +171,11 @@ async function _handleTripDetection({
       openTrip.maxSpeed      = parseFloat(newMaxSpeed.toFixed(1));
       openTrip.avgSpeed      = parseFloat(avgSpeed.toFixed(1));
       openTrip.isCompleted   = true;
-
       await openTrip.save();
-
       logger.info(
         '🏁 Trip ENDED | imei=%s | tripId=%s | %.2f km | %d min | maxSpeed=%.1f km/h',
         imei, prev.tripId, prev.totalDistance, duration, newMaxSpeed,
       );
-
       if (global.io) {
         global.io.emit('trip_ended', {
           tripId:        prev.tripId.toString(),
@@ -248,20 +190,14 @@ async function _handleTripDetection({
     logger.error('❌ endTrip error for imei=%s: %s', imei, err.message);
   }
 
-  // Reset state — no open trip
   _tripState.set(stateKey, {
-    tripId:        null,
-    idleSince:     null,
-    lastLat:       lat,
-    lastLng:       lng,
-    maxSpeed:      0,
-    totalDistance: 0,
-    speedReadings: [],
+    tripId: null, idleSince: null,
+    lastLat: lat, lastLng: lng,
+    maxSpeed: 0, totalDistance: 0, speedReadings: [],
   });
 }
-// ─────────────────────────────────────────────────────────────────────────────
 
-
+// ── Main processor ────────────────────────────────────────────────────────────
 async function processBulkUpdates(deviceArray) {
   if (!deviceArray || deviceArray.length === 0) return;
 
@@ -271,19 +207,17 @@ async function processBulkUpdates(deviceArray) {
   const vehicleOps = [];
   const pingOps    = [];
   const now        = new Date();
-
-  // Collect trip detection tasks to run after the bulk write
   const tripTasks  = [];
 
   try {
-    const vehicles = await Vehicle.find({
-      imei: { $in: deviceArray.map(d => d.imei) }
-    }, '_id imei lastKnownLocation').lean();
+    const vehicles = await Vehicle.find(
+      { imei: { $in: deviceArray.map(d => d.imei) } },
+      '_id imei lastKnownLocation'
+    ).lean();
 
     const idMap = new Map(vehicles.map(v => [v.imei, v._id]));
 
     for (const dev of deviceArray) {
-      // DEBUG — remove once working correctly
       logger.info('🔍 Raw IOP data: %s', JSON.stringify(dev));
 
       const vId = idMap.get(dev.imei);
@@ -292,28 +226,22 @@ async function processBulkUpdates(deviceArray) {
         continue;
       }
 
-      // IOPGPS sends gpsTime/signalTime as unix seconds
       const timestamp = dev.gpsTime
         ? new Date(dev.gpsTime * 1000)
         : dev.signalTime
           ? new Date(dev.signalTime * 1000)
           : now;
 
-      // IOPGPS sends lat/lng as STRINGS — parse first, then convert GCJ-02 → WGS-84
       const rawLat = dev.lat != null ? parseFloat(dev.lat) : null;
       const rawLng = dev.lng != null ? parseFloat(dev.lng) : null;
 
-      // Convert GCJ-02 → WGS-84 so Flutter / Google Maps shows the correct location
       const { lat, lng } = (rawLat != null && rawLng != null)
         ? gcj02ToWgs84(rawLng, rawLat)
         : { lat: rawLat, lng: rawLng };
 
-      // Online = signalTime received within last 5 minutes
-      // NOTE: accStatus is ignition (on/off), NOT connectivity — not used for isOnline
       const fiveMinutesAgo = (Date.now() / 1000) - 300;
       const isOnline = dev.signalTime != null && dev.signalTime >= fiveMinutesAgo;
 
-      // Valid GPS = parsed floats, not NaN, not 0,0
       const hasValidGPS =
         lat != null && lng != null &&
         !isNaN(lat) && !isNaN(lng) &&
@@ -321,14 +249,36 @@ async function processBulkUpdates(deviceArray) {
 
       const speed = dev.speed ?? 0;
 
+      // ── ✅ ADDRESS RESOLUTION ─────────────────────────────────────────────
+      // IOPGPS sends the human-readable address in dev.address.
+      // We try that first, then fall back to Nominatim reverse geocoding,
+      // then fall back to a coordinate string — so "Unknown location" NEVER
+      // appears in the Flutter app.
+      let address = null;
+
+      // 1. Direct from IOPGPS response (most reliable, no extra HTTP call)
+      if (dev.address && dev.address.trim().length > 0) {
+        address = dev.address.trim();
+        logger.info('📍 Address from IOPGPS: %s', address);
+      }
+      // 2. Nominatim reverse geocoding (free fallback when IOPGPS omits address)
+      else if (hasValidGPS) {
+        address = await _reverseGeocode(lat, lng);
+        if (address) logger.info('📍 Address from Nominatim: %s', address);
+      }
+      // 3. Coordinate string fallback — always better than "Unknown location"
+      if (!address && hasValidGPS) {
+        address = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+        logger.info('📍 Address fallback (coords): %s', address);
+      }
+
       logger.info(
-        '🔍 IMEI %s | isOnline=%s | hasValidGPS=%s | lat=%s | lng=%s (raw GCJ-02: %s,%s) | speed=%s',
+        '🔍 IMEI %s | isOnline=%s | hasValidGPS=%s | lat=%s | lng=%s | speed=%s | address=%s',
         dev.imei, isOnline, hasValidGPS,
-        lat?.toFixed(6), lng?.toFixed(6),
-        rawLat, rawLng, speed
+        lat?.toFixed(6), lng?.toFixed(6), speed, address
       );
 
-      // ── Base fields (always written every poll) ───────────────────────────
+      // ── Base fields ───────────────────────────────────────────────────────
       const baseUpdate = {
         speed,
         heading:    dev.course ?? 0,
@@ -342,31 +292,39 @@ async function processBulkUpdates(deviceArray) {
             : 'idle',
       };
 
-      // Update live coords when GPS is valid (WGS-84)
       if (hasValidGPS) {
+        // Store in both naming conventions for max compatibility
+        baseUpdate.lat       = lat;
+        baseUpdate.lng       = lng;
         baseUpdate.latitude  = lat;
         baseUpdate.longitude = lng;
       }
 
+      // ✅ Always write address to top-level fields so vehicleController
+      //    can select them without touching lastKnownLocation
+      if (address) {
+        baseUpdate.address           = address;
+        baseUpdate.location          = address;
+        baseUpdate.formattedLocation = address;
+      }
+
       // ── lastKnownLocation ─────────────────────────────────────────────────
-      // Written whenever we have valid GPS — online OR offline.
-      // This is what Flutter shows when isOnline === false.
       const conditionalUpdate = {};
       if (hasValidGPS) {
         conditionalUpdate.lastKnownLocation = {
-          latitude:  lat,                   // WGS-84
-          longitude: lng,                   // WGS-84
+          latitude:  lat,
+          longitude: lng,
           speed,
-          heading:   dev.course ?? 0,
+          heading:   dev.course   ?? 0,
           altitude:  dev.altitude ?? 0,
-          // extVoltage is integer e.g. 130 = 13.0V
           voltage:   dev.extVoltage != null ? dev.extVoltage / 10 : null,
-          odometer:  dev.odometer   ?? null,
+          odometer:  dev.odometer  ?? dev.mileage ?? null,
+          // ✅ address saved here too so lastKnownLocation.address is populated
+          address:   address ?? null,
           timestamp,
         };
       }
 
-      // lastOnlineAt — only update when device was actually online
       if (isOnline && hasValidGPS) {
         conditionalUpdate.lastOnlineAt = timestamp;
       }
@@ -374,37 +332,51 @@ async function processBulkUpdates(deviceArray) {
       vehicleOps.push({
         updateOne: {
           filter: { imei: dev.imei },
-          update: { $set: { ...baseUpdate, ...conditionalUpdate } }
-        }
+          update: { $set: { ...baseUpdate, ...conditionalUpdate } },
+        },
       });
 
-      // ── Location ping (trip history) ──────────────────────────────────────
-      // Only record when moving + online + valid GPS
+      // ── Socket push — emit updated vehicle to Flutter immediately ─────────
+      // This means Flutter gets the address in real time, not just on next REST poll.
+      if (global.io) {
+        // We need the vehicle's Mongo _id for the socket payload
+        const vehicleDbId = idMap.get(dev.imei);
+        global.io.emit('vehicle_movement', {
+          id:                vehicleDbId?.toString(),
+          imei:              dev.imei,
+          lat,
+          lng,
+          latitude:          lat,
+          longitude:         lng,
+          speed,
+          heading:           dev.course ?? 0,
+          isOnline,
+          isLive:            isOnline,
+          status:            baseUpdate.status,
+          // ✅ All three address field names so Flutter _resolveAddress() finds it
+          address,
+          location:          address,
+          formattedLocation: address,
+          lastKnownLocation: conditionalUpdate.lastKnownLocation ?? null,
+          lastUpdate:        now.toISOString(),
+        });
+      }
+
+      // ── Location ping ─────────────────────────────────────────────────────
       if (isOnline && hasValidGPS && speed > 0) {
         pingOps.push({
           vehicleId: vId,
-          latitude:  lat,                   // WGS-84
-          longitude: lng,                   // WGS-84
+          latitude:  lat,
+          longitude: lng,
           speed,
           heading:   dev.course ?? 0,
           timestamp,
         });
       }
 
-      // ── Queue trip detection for after the bulk write ─────────────────────
-      tripTasks.push({
-        vehicleId:   vId,
-        imei:        dev.imei,
-        isOnline,
-        speed,
-        lat,
-        lng,
-        timestamp,
-        hasValidGPS,
-      });
+      tripTasks.push({ vehicleId: vId, imei: dev.imei, isOnline, speed, lat, lng, timestamp, hasValidGPS });
     }
 
-    // ── Commit vehicle + ping writes to MongoDB ────────────────────────────
     await Promise.all([
       vehicleOps.length > 0
         ? Vehicle.bulkWrite(vehicleOps, { ordered: false })
@@ -415,12 +387,9 @@ async function processBulkUpdates(deviceArray) {
     ]);
 
     logger.info(
-      `🚀 Data Processor: Synced ${deviceArray.length} units — ` +
-      `${pingOps.length} pings recorded`
+      `🚀 Data Processor: Synced ${deviceArray.length} units — ${pingOps.length} pings recorded`
     );
 
-    // ── Run trip detection AFTER bulk write succeeds ───────────────────────
-    // Run sequentially (not Promise.all) to avoid race conditions on _tripState
     for (const task of tripTasks) {
       await _handleTripDetection(task);
     }
