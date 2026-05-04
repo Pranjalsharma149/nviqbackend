@@ -77,15 +77,9 @@ async function boot() {
   app.use('/api/analytics', require('./routes/analytics.routes'));
   app.use('/api/support',   require('./routes/support.routes'));
   app.use('/api/geofences', require('./routes/geofence.routes'));
+
+  // ✅ NEW: Trip routes (history + analytics hub)
   app.use('/api/trips',     require('./routes/trip.routes'));
-
-  // ✅ NEW: Referral routes
-  app.use('/api/referral',  require('./routes/referral.routes'));
-
-  // ── Health check ────────────────────────────────────────────────────────────
-  app.get('/api/health', (req, res) =>
-    res.json({ status: 'ok', time: new Date().toISOString() })
-  );
 
   // ── Socket Connection Logic ─────────────────────────────────────────────────
   io.on('connection', (socket) => {
@@ -100,8 +94,12 @@ async function boot() {
   });
 
   // ── Background Services ─────────────────────────────────────────────────────
+
+  // A. TCP GPS Server (GT06/Hardware devices)
   const GPS_PORT = process.env.GPS_TCP_PORT || 5001;
   require('./services/gps.server').startGpsServer(GPS_PORT);
+
+  // B. WanWay Cloud Poller
   wanwayPoller.start();
 
   // ── Launch HTTP Server ──────────────────────────────────────────────────────
