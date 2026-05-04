@@ -1,36 +1,20 @@
 'use strict';
 
-/**
- * gps.server.js
- * ─────────────────────────────────────────────────────────────────────────────
- * TCP server that accepts direct connections from GPS hardware devices.
- * Supports GT06 protocol — used by PRIME09 and VL149 (and most Chinese trackers).
- *
- * Devices connect here when NOT going through WanWay/IOP GPS platform.
- * Configure each device via SMS:
- *   SERVER,0,[YOUR_PUBLIC_IP],5001,0#
- *   APN,[YOUR_APN]#
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * INSTALL DEPENDENCY:
- *   npm install gt06
- */
-
-const net     = require('net');
-const Gt06    = require('gt06');
-const Vehicle = require('../models/Vehicle');
+const net          = require('net');
+const Gt06         = require('gt06');
+const Vehicle      = require('../models/Vehicle');
 const LocationPing = require('../models/LocationPing');
 const GPSEngine    = require('../controllers/geofenceController');
-const logger  = require('../utils/logger');
+const logger       = require('../utils/logger');
 
-// ── GCJ-02 → WGS-84 converter (same as data.processor.js) ────────────────────
-// Direct TCP devices also send GCJ-02 coordinates.
+// ── GCJ-02 → WGS-84 converter ────────────────────────────────────────────────
 function gcj02ToWgs84(gcjLng, gcjLat) {
   const a  = 6378245.0;
   const ee = 0.00669342162296594323;
 
   function transformLat(lng, lat) {
-    let r = -100 + 2*lng + 3*lat + 0.2*lat*lat + 0.1*lng*lat + 0.2*Math.sqrt(Math.abs(lng));
+    let r = -100 + 2*lng + 3*lat + 0.2*lat*lat + 0.1*lng*lat
+            + 0.2*Math.sqrt(Math.abs(lng));
     r += (20*Math.sin(6*lng*Math.PI) + 20*Math.sin(2*lng*Math.PI)) * 2/3;
     r += (20*Math.sin(lat*Math.PI)   + 40*Math.sin(lat/3*Math.PI)) * 2/3;
     r += (160*Math.sin(lat/12*Math.PI) + 320*Math.sin(lat*Math.PI/30)) * 2/3;
@@ -38,7 +22,8 @@ function gcj02ToWgs84(gcjLng, gcjLat) {
   }
 
   function transformLng(lng, lat) {
-    let r = 300 + lng + 2*lat + 0.1*lng*lng + 0.1*lng*lat + 0.1*Math.sqrt(Math.abs(lng));
+    let r = 300 + lng + 2*lat + 0.1*lng*lng + 0.1*lng*lat
+            + 0.1*Math.sqrt(Math.abs(lng));
     r += (20*Math.sin(6*lng*Math.PI) + 20*Math.sin(2*lng*Math.PI)) * 2/3;
     r += (20*Math.sin(lng*Math.PI)   + 40*Math.sin(lng/3*Math.PI)) * 2/3;
     r += (150*Math.sin(lng/12*Math.PI) + 300*Math.sin(lng/30*Math.PI)) * 2/3;
@@ -53,16 +38,24 @@ function gcj02ToWgs84(gcjLng, gcjLat) {
   const sqrtMagic = Math.sqrt(magic);
 
   return {
-    lat: gcjLat - (dLat * 180) / ((a * (1 - ee)) / (magic * sqrtMagic) * Math.PI),
-    lng: gcjLng - (dLng * 180) / (a / sqrtMagic * Math.cos(radLat) * Math.PI),
+    lat: gcjLat - (dLat * 180) / ((a*(1-ee))/(magic*sqrtMagic) * Math.PI),
+    lng: gcjLng - (dLng * 180) / (a/sqrtMagic * Math.cos(radLat) * Math.PI),
   };
 }
 
-// ── Shared State ──────────────────────────────────────────────────────────────
-const imeiCache = new Map();   // vehicle doc cache (5 min TTL)
-const lastPos   = new Map();   // jitter filter
+// ── Constants ─────────────────────────────────────────────────────────────────
+const MAX_GPS_AGE_MINUTES  = 10;   // Reject fixes older than 10 minutes
+const MAX_SPEED_KMH        = 250;  // Reject impossible speeds
+const INDIA_BOUNDS = {             // Rough India bounding box
+  minLat: 6.0,  maxLat: 37.6,
+  minLng: 68.0, maxLng: 97.5,
+};
 
-// ── Vehicle resolver (cached) ─────────────────────────────────────────────────
+// ── Shared State ──────────────────────────────────────────────────────────────
+const imeiCache = new Map();
+const lastPos   = new Map();
+
+// ── Vehicle resolver (cached 5 min) ──────────────────────────────────────────
 async function resolveVehicle(imei) {
   const now = Date.now();
   const hit = imeiCache.get(imei);
@@ -75,7 +68,7 @@ async function resolveVehicle(imei) {
   return doc;
 }
 
-// ── Jitter filter (skip duplicate pings within 5s) ────────────────────────────
+// ── Jitter filter ─────────────────────────────────────────────────────────────
 function isDuplicate(imei, lat, lng) {
   const p = lastPos.get(imei);
   if (!p) return false;
@@ -85,23 +78,94 @@ function isDuplicate(imei, lat, lng) {
     Math.abs(lng - p.lng) < 0.000009;
 }
 
-// ── Core position processor ───────────────────────────────────────────────────
-async function processPosition({ imei, lat, lng, speed, heading, timestamp }) {
-  // Reject invalid / 0,0 coordinates
-  if (!lat || !lng || (Math.abs(lat) < 0.1 && Math.abs(lng) < 0.1)) return;
-  if (isDuplicate(imei, lat, lng)) return;
+// ── Coordinate validator ──────────────────────────────────────────────────────
+function isValidCoordinate(lat, lng) {
+  if (!isFinite(lat) || !isFinite(lng))     return false;
+  if (Math.abs(lat) < 0.1 && Math.abs(lng) < 0.1) return false; // null island
+  if (lat < INDIA_BOUNDS.minLat || lat > INDIA_BOUNDS.maxLat)   return false;
+  if (lng < INDIA_BOUNDS.minLng || lng > INDIA_BOUNDS.maxLng)   return false;
+  return true;
+}
 
+// ── GPS age validator ─────────────────────────────────────────────────────────
+function isGpsFresh(gpsTimestamp) {
+  if (!gpsTimestamp) return false;
+  const serverTime  = Date.now();
+  const gpsTime     = new Date(gpsTimestamp).getTime();
+  if (isNaN(gpsTime)) return false;
+
+  const diffMinutes = Math.abs(serverTime - gpsTime) / 60000;
+  return diffMinutes <= MAX_GPS_AGE_MINUTES;
+}
+
+// ── Core position processor ───────────────────────────────────────────────────
+async function processPosition({
+  imei,
+  lat,
+  lng,
+  speed,
+  heading,
+  gpsTimestamp,    // The GPS device fix time
+  satellites = 0,
+  accuracy   = 0,
+}) {
+  const serverReceiptTime = new Date(); // Always use server time for freshness
+
+  // ── Validate coordinates ───────────────────────────────────────────────────
+  if (!isValidCoordinate(lat, lng)) {
+    logger.warn('⚠️ [TCP] REJECTED invalid coords for %s: lat=%s lng=%s',
+      imei, lat, lng);
+    return;
+  }
+
+  // ── Validate GPS fix freshness ─────────────────────────────────────────────
+  if (gpsTimestamp && !isGpsFresh(gpsTimestamp)) {
+    const ageMin = Math.round(
+      Math.abs(Date.now() - new Date(gpsTimestamp).getTime()) / 60000
+    );
+    logger.warn(
+      '⚠️ [TCP] REJECTED stale GPS fix for %s: ' +
+      'gpsTime=%s serverTime=%s age=%dmin',
+      imei,
+      new Date(gpsTimestamp).toISOString(),
+      serverReceiptTime.toISOString(),
+      ageMin
+    );
+    // Still mark device online (it connected) but don't update position
+    await Vehicle.findOneAndUpdate(
+      { imei },
+      {
+        $set: {
+          isOnline:     true,
+          isLive:       true,
+          lastOnlineAt: serverReceiptTime,
+          // DO NOT update latitude/longitude/lastUpdate
+        },
+      }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Validate speed ─────────────────────────────────────────────────────────
+  if (speed > MAX_SPEED_KMH) {
+    logger.warn('⚠️ [TCP] REJECTED impossible speed for %s: %s km/h', imei, speed);
+    return;
+  }
+
+  // ── Duplicate check ────────────────────────────────────────────────────────
+  if (isDuplicate(imei, lat, lng)) return;
   lastPos.set(imei, { lat, lng, ts: Date.now() });
 
+  // ── Resolve vehicle ────────────────────────────────────────────────────────
   const vehicle = await resolveVehicle(imei);
   if (!vehicle) {
-    logger.warn('⚠️ [TCP] Unknown IMEI: %s — not in DB', imei);
+    logger.warn('⚠️ [TCP] Unknown IMEI: %s', imei);
     return;
   }
 
   const status = speed > 5 ? 'moving' : 'idle';
-  const ts     = timestamp || new Date();
 
+  // ── Update DB ──────────────────────────────────────────────────────────────
   const updated = await Vehicle.findByIdAndUpdate(
     vehicle._id,
     {
@@ -113,23 +177,38 @@ async function processPosition({ imei, lat, lng, speed, heading, timestamp }) {
         status,
         isOnline:  true,
         isLive:    true,
-        lastUpdate: ts,
-        lastOnlineAt: ts,
+
+        // KEY FIX: Store BOTH times separately
+        lastUpdate:    serverReceiptTime, // When SERVER received it
+        gpsFixTime:    gpsTimestamp ? new Date(gpsTimestamp) : serverReceiptTime,
+        lastOnlineAt:  serverReceiptTime,
+
         lastKnownLocation: {
-          latitude:  lat,
-          longitude: lng,
-          speed:     Math.round(speed),
+          latitude:   lat,
+          longitude:  lng,
+          speed:      Math.round(speed),
           heading,
-          timestamp: ts,
+          timestamp:  gpsTimestamp ? new Date(gpsTimestamp) : serverReceiptTime,
+          serverTime: serverReceiptTime,
         },
       },
     },
     { new: true, lean: true }
   );
 
-  logger.info('📍 [TCP] %s | lat=%s lng=%s speed=%s', imei, lat.toFixed(6), lng.toFixed(6), speed);
+  logger.info(
+    '📍 [TCP] %s | lat=%s lng=%s speed=%s sats=%s gpsAge=%ds',
+    imei,
+    lat.toFixed(6),
+    lng.toFixed(6),
+    speed,
+    satellites,
+    gpsTimestamp
+      ? Math.round((Date.now() - new Date(gpsTimestamp).getTime()) / 1000)
+      : 0
+  );
 
-  // Emit real-time update to Flutter via Socket.IO
+  // ── Emit to Flutter via Socket.IO ──────────────────────────────────────────
   if (global.io) {
     global.io.emit('vehicleMovement', {
       id:          updated._id.toString(),
@@ -140,21 +219,31 @@ async function processPosition({ imei, lat, lng, speed, heading, timestamp }) {
       status,
       heading,
       isOnline:    true,
-      lastUpdate:  ts,
+      satellites,
+      accuracy,
+
+      // KEY FIX: Send BOTH timestamps so Flutter can check freshness
+      gpsTime:    gpsTimestamp
+                    ? new Date(gpsTimestamp).toISOString()
+                    : serverReceiptTime.toISOString(),
+      deviceTime: serverReceiptTime.toISOString(), // Server receipt time
+      lastUpdate: serverReceiptTime.toISOString(),
     });
   }
 
-  // Non-blocking: save ping + check geofences
+  // ── Non-blocking: save ping + geofence check ───────────────────────────────
   setImmediate(async () => {
     try {
       if (speed > 0) {
         await LocationPing.create({
-          vehicleId: updated._id,
-          latitude:  lat,
-          longitude: lng,
-          speed:     updated.speed,
+          vehicleId:  updated._id,
+          latitude:   lat,
+          longitude:  lng,
+          speed:      updated.speed,
           heading,
-          timestamp: ts,
+          timestamp:  gpsTimestamp ? new Date(gpsTimestamp) : serverReceiptTime,
+          serverTime: serverReceiptTime,
+          satellites,
         });
       }
       await GPSEngine.checkGeofences(updated);
@@ -170,9 +259,8 @@ const startGpsServer = (port) => {
     const remoteAddr = `${socket.remoteAddress}:${socket.remotePort}`;
     logger.info('🛰️ [TCP] Device connected from %s', remoteAddr);
 
-    // Each socket gets its own GT06 parser instance
     const parser = new Gt06();
-    let   deviceImei = null;
+    let deviceImei = null;
 
     socket.on('data', (data) => {
       try {
@@ -182,16 +270,14 @@ const startGpsServer = (port) => {
         return;
       }
 
-      // Send ACK if device expects a response (login, heartbeat, etc.)
       if (parser.expectsResponse) {
         try {
           socket.write(parser.responseMsg);
         } catch (e) {
-          logger.warn('⚠️ [TCP] Failed to send ACK: %s', e.message);
+          logger.warn('⚠️ [TCP] ACK failed: %s', e.message);
         }
       }
 
-      // Process each message in the buffer
       for (const msg of parser.msgBuffer) {
         try {
           handleGt06Message(msg, socket, remoteAddr, (imei) => {
@@ -206,10 +292,8 @@ const startGpsServer = (port) => {
     });
 
     socket.on('close', () => {
-      logger.info('🔌 [TCP] Device disconnected: %s (IMEI: %s)',
+      logger.info('🔌 [TCP] Disconnected: %s (IMEI: %s)',
         remoteAddr, deviceImei || 'unknown');
-
-      // Mark device offline when TCP connection drops
       if (deviceImei) {
         Vehicle.findOneAndUpdate(
           { imei: deviceImei },
@@ -222,11 +306,10 @@ const startGpsServer = (port) => {
       logger.error('❌ [TCP] Socket error (%s): %s', remoteAddr, err.message);
     });
 
-    // Keep connection alive
     socket.setKeepAlive(true, 30000);
-    socket.setTimeout(120000); // 2 min timeout — device should heartbeat every 60s
+    socket.setTimeout(120000);
     socket.on('timeout', () => {
-      logger.warn('⏰ [TCP] Socket timeout: %s', remoteAddr);
+      logger.warn('⏰ [TCP] Timeout: %s', remoteAddr);
       socket.destroy();
     });
   });
@@ -248,18 +331,16 @@ function handleGt06Message(msg, socket, remoteAddr, onImei) {
 
   switch (type) {
 
-    // ── Login packet — device sends IMEI to identify itself ─────────────────
     case 'login':
     case 'LOGIN': {
       const imei = msg.imei || msg.deviceId;
       if (imei) {
         onImei(String(imei));
-        logger.info('🔑 [TCP] Login from IMEI: %s (%s)', imei, remoteAddr);
+        logger.info('🔑 [TCP] Login IMEI: %s (%s)', imei, remoteAddr);
       }
       break;
     }
 
-    // ── GPS location packet ───────────────────────────────────────────────────
     case 'gps':
     case 'GPS':
     case 'location':
@@ -269,36 +350,33 @@ function handleGt06Message(msg, socket, remoteAddr, onImei) {
 
       const rawLat = msg.latitude  ?? msg.lat;
       const rawLng = msg.longitude ?? msg.lng;
-
       if (rawLat == null || rawLng == null) break;
 
-      // Convert GCJ-02 → WGS-84
       const { lat, lng } = gcj02ToWgs84(parseFloat(rawLng), parseFloat(rawLat));
 
-      const speed   = msg.speed   ?? 0;
-      const heading = msg.course  ?? msg.heading ?? 0;
-      const gpsTime = msg.gpsTime ?? msg.dateTime ?? msg.timestamp;
-      const timestamp = gpsTime ? new Date(gpsTime) : new Date();
+      // KEY FIX: Pass gpsTimestamp separately from server time
+      const gpsTimestamp = msg.gpsTime ?? msg.dateTime ?? msg.timestamp ?? null;
 
       processPosition({
-        imei: String(imei),
+        imei:         String(imei),
         lat,
         lng,
-        speed:   parseFloat(speed),
-        heading: parseFloat(heading),
-        timestamp,
-      }).catch(err => logger.error('❌ [TCP] processPosition error: %s', err.message));
-
+        speed:        parseFloat(msg.speed  ?? 0),
+        heading:      parseFloat(msg.course ?? msg.heading ?? 0),
+        satellites:   parseInt(msg.satellites ?? msg.sats ?? 0, 10),
+        accuracy:     parseFloat(msg.accuracy ?? msg.hdop ?? 0),
+        gpsTimestamp, // GPS device fix time — may be stale
+      }).catch(err =>
+        logger.error('❌ [TCP] processPosition error: %s', err.message)
+      );
       break;
     }
 
-    // ── Heartbeat — keep-alive, no position data ──────────────────────────────
     case 'heartbeat':
     case 'HEARTBEAT': {
       const imei = msg.imei || msg.deviceId;
       if (imei) {
-        logger.info('💓 [TCP] Heartbeat from IMEI: %s', imei);
-        // Update lastUpdate so device stays "online"
+        logger.info('💓 [TCP] Heartbeat IMEI: %s', imei);
         Vehicle.findOneAndUpdate(
           { imei: String(imei) },
           { $set: { isOnline: true, isLive: true, lastUpdate: new Date() } }
@@ -307,36 +385,32 @@ function handleGt06Message(msg, socket, remoteAddr, onImei) {
       break;
     }
 
-    // ── Alarm packet ──────────────────────────────────────────────────────────
     case 'alarm':
     case 'ALARM': {
       const imei = msg.imei || msg.deviceId;
-      logger.warn('🚨 [TCP] Alarm from IMEI: %s | type: %s', imei, msg.alarmType || 'unknown');
-      // Position data is often included in alarm packets too
+      logger.warn('🚨 [TCP] Alarm IMEI: %s type: %s',
+        imei, msg.alarmType || 'unknown');
       if (msg.latitude && msg.longitude) {
         const { lat, lng } = gcj02ToWgs84(
           parseFloat(msg.longitude),
           parseFloat(msg.latitude)
         );
+        const gpsTimestamp = msg.gpsTime ?? msg.dateTime ?? null;
         processPosition({
-          imei:      String(imei),
+          imei:         String(imei),
           lat, lng,
-          speed:     parseFloat(msg.speed   ?? 0),
-          heading:   parseFloat(msg.course  ?? 0),
-          timestamp: new Date(),
+          speed:        parseFloat(msg.speed  ?? 0),
+          heading:      parseFloat(msg.course ?? 0),
+          gpsTimestamp,
         }).catch(() => {});
       }
       break;
     }
 
     default:
-      // Log unknown message types to help debug new device variants
-      logger.debug('📦 [TCP] Unknown message type: %s | data: %j', type, msg);
+      logger.debug('📦 [TCP] Unknown msg type: %s | %j', type, msg);
       break;
   }
 }
 
-module.exports = {
-  startGpsServer,
-  processPosition,
-};
+module.exports = { startGpsServer, processPosition };
