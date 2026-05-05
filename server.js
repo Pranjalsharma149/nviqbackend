@@ -77,9 +77,11 @@ async function boot() {
   app.use('/api/analytics', require('./routes/analytics.routes'));
   app.use('/api/support',   require('./routes/support.routes'));
   app.use('/api/geofences', require('./routes/geofence.routes'));
-
-  // ✅ NEW: Trip routes (history + analytics hub)
   app.use('/api/trips',     require('./routes/trip.routes'));
+
+  // ✅ ADDED: Referral routes — required for GET /api/referral/my,
+  // GET /api/referral/validate/:code, POST /api/referral/apply
+  app.use('/api/referral',  require('./routes/referral.routes'));
 
   // ── Socket Connection Logic ─────────────────────────────────────────────────
   io.on('connection', (socket) => {
