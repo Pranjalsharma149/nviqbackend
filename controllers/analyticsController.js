@@ -1,135 +1,338 @@
 'use strict';
 
-const Vehicle = require('../models/Vehicle');
-const Alert = require('../models/Alert');
-const Trip = require('../models/Trip'); // Using Trip model for distance instead of raw pings
+/**
+ * controllers/analyticsController.js
+ *
+ * Express controller that backs the /api/analytics/* routes.
+ *
+ * Routes (from analytics.routes.js):
+ *   GET /fleet/summary        → getFleetSummary
+ *   GET /fleet/trends         → getFleetTrends
+ *   GET /vehicles/:id         → getVehicleAnalytics
+ *
+ * All heavy lifting is delegated to analytics.service.js.
+ * Controllers only handle HTTP: validate input, call service, format response.
+ */
+
+const mongoose        = require('mongoose');
+const AnalyticsService = require('../services/analytics.service');
+const DailySummary    = require('../models/DailySummary');
+const Vehicle         = require('../models/Vehicle');
+const logger          = require('../utils/logger');
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function isValidObjectId(id) {
+  return mongoose.Types.ObjectId.isValid(id);
+}
+
+/** Send a uniform error response. */
+function sendError(res, status, message, detail = undefined) {
+  const body = { success: false, message };
+  if (detail && process.env.NODE_ENV !== 'production') body.detail = detail;
+  return res.status(status).json(body);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/analytics/fleet/summary
 // ─────────────────────────────────────────────────────────────────────────────
-exports.getFleetSummary = async (req, res) => {
+/**
+ * Fleet-wide KPI card — live data, no caching.
+ *
+ * Response:
+ * {
+ *   success: true,
+ *   data: {
+ *     totalCount, movingCount, idleCount, offlineCount,
+ *     totalDistance, avgSpeed, uptime, lastUpdated
+ *   }
+ * }
+ */
+async function getFleetSummary(req, res) {
   try {
-    const days = parseInt(req.query.days || '7');
-    const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-
-    // Parallel counts for the dashboard
-    const [counts, alertCount, tripStats] = await Promise.all([
-      // Optimized: Get all status counts in one aggregation
-      Vehicle.aggregate([
-        {
-          $group: {
-            _id: null,
-            total: { $sum: 1 },
-            moving: { $sum: { $cond: [{ $eq: ['$status', 'moving'] }, 1, 0] } },
-            idle: { $sum: { $cond: [{ $eq: ['$status', 'static'] }, 1, 0] } }, // WanWay uses 'static'
-            offline: { $sum: { $cond: [{ $eq: ['$isOnline', false] }, 1, 0] } }
-          }
-        }
-      ]),
-      Alert.countDocuments({ timestamp: { $gte: startDate } }),
-      // CRITICAL: Calculate distance from Trip summaries, NOT raw pings
-      Trip.aggregate([
-        { $match: { startTime: { $gte: startDate }, isCompleted: true } },
-        {
-          $group: {
-            _id: null,
-            totalDistance: { $sum: '$totalDistance' },
-            avgSpeed: { $avg: '$avgSpeed' }
-          }
-        }
-      ])
-    ]);
-
-    const stats = counts[0] || { total: 0, moving: 0, idle: 0, offline: 0 };
-    const distanceData = tripStats[0] || { totalDistance: 0, avgSpeed: 0 };
-
-    res.json({
-      success: true,
-      data: {
-        total: stats.total,
-        moving: stats.moving,
-        idle: stats.idle,
-        offline: stats.offline,
-        totalDistance: distanceData.totalDistance.toFixed(2),
-        avgSpeed: distanceData.avgSpeed.toFixed(1),
-        alerts: alertCount,
-        period: { days, start: startDate.toISOString(), end: new Date().toISOString() },
-      },
-    });
-  } catch (error) {
-    console.error('Analytics Error:', error.message);
-    res.status(500).json({ success: false, message: 'Internal Server Error' });
+    const data = await AnalyticsService.getFleetSummary();
+    return res.json({ success: true, data });
+  } catch (err) {
+    logger.error('[AnalyticsCtrl] getFleetSummary: %s', err.message);
+    return sendError(res, 500, 'Failed to fetch fleet summary', err.message);
   }
-};
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/analytics/vehicles/:id (Individual Vehicle)
+// GET /api/analytics/fleet/trends
+//   ?days=7           Rolling window (1-90, default 7)
+//   ?vehicleId=...    Optional: single vehicle trends (else fleet aggregate)
 // ─────────────────────────────────────────────────────────────────────────────
-exports.getVehicleAnalytics = async (req, res) => {
+/**
+ * Returns an array of daily stats objects suitable for a line chart.
+ *
+ * When vehicleId is provided → per-vehicle DailySummary records.
+ * When omitted              → fleet aggregate (sum across all vehicles per day).
+ *
+ * Response:
+ * {
+ *   success: true,
+ *   data: {
+ *     days: number,
+ *     series: [
+ *       { date: 'YYYY-MM-DD', totalDistance, engineHours, idleHours,
+ *         maxSpeed, avgSpeed, tripCount, vehicleCount? },
+ *       ...
+ *     ]
+ *   }
+ * }
+ */
+async function getFleetTrends(req, res) {
   try {
-    const days = parseInt(req.query.days || '7');
-    const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const days      = Math.min(Math.max(parseInt(req.query.days ?? 7, 10), 1), 90);
+    const vehicleId = req.query.vehicleId;
 
-    // Fetch summaries from the Trip model instead of calculating from raw pings
-    const [vehicle, tripSummary, alerts] = await Promise.all([
-      Vehicle.findById(req.params.id).lean(),
-      Trip.aggregate([
-        { $match: { vehicleId: req.params.id, startTime: { $gte: startDate } } },
-        {
-          $group: {
-            _id: null,
-            totalDist: { $sum: '$totalDistance' },
-            maxSpeed: { $max: '$maxSpeed' },
-            avgSpeed: { $avg: '$avgSpeed' },
-            tripCount: { $sum: 1 }
-          }
-        }
-      ]),
-      Alert.countDocuments({ vehicleId: req.params.id, timestamp: { $gte: startDate } })
-    ]);
+    // Date window
+    const endDate   = new Date();
+    const startDate = new Date(Date.now() - days * 86_400_000);
 
-    if (!vehicle) return res.status(404).json({ success: false, message: 'Vehicle not found' });
-
-    const stats = tripSummary[0] || { totalDist: 0, maxSpeed: 0, avgSpeed: 0, tripCount: 0 };
-
-    res.json({
-      success: true,
-      data: {
-        totalDistance: stats.totalDist.toFixed(2),
-        totalTrips: stats.tripCount,
-        avgSpeed: stats.avgSpeed.toFixed(1),
-        maxSpeed: stats.maxSpeed.toFixed(1),
-        alerts: alerts,
-        vehicle: { id: vehicle._id, name: vehicle.name, vehicleReg: vehicle.vehicleReg }
+    if (vehicleId) {
+      // ── Single vehicle trend ──────────────────────────────────────────────
+      if (!isValidObjectId(vehicleId)) {
+        return sendError(res, 400, 'Invalid vehicleId');
       }
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/analytics/fleet/trends (Distance per day for the fleet)
-// ─────────────────────────────────────────────────────────────────────────────
-exports.getFleetTrends = async (req, res) => {
-  try {
-    const days = parseInt(req.query.days || '7');
-    const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      const series = await AnalyticsService.getDateRangeAnalytics(
+        vehicleId,
+        startDate.toISOString().split('T')[0],
+        endDate.toISOString().split('T')[0]
+      );
 
-    const trends = await Trip.aggregate([
-      { $match: { startTime: { $gte: startDate }, isCompleted: true } },
+      return res.json({ success: true, data: { days, vehicleId, series } });
+    }
+
+    // ── Fleet aggregate trend ─────────────────────────────────────────────
+    // Sum DailySummary across all vehicles, grouped by date.
+    const pipeline = [
+      {
+        $match: {
+          date: {
+            $gte: new Date(
+              Date.UTC(startDate.getUTCFullYear(), startDate.getUTCMonth(), startDate.getUTCDate())
+            ),
+          },
+        },
+      },
       {
         $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$startTime" } },
-          distance: { $sum: "$totalDistance" },
-          trips: { $sum: 1 }
-        }
+          _id:           { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
+          totalDistance: { $sum: '$totalDistance' },
+          engineHours:   { $sum: '$engineHours' },
+          idleHours:     { $sum: '$idleHours' },
+          runningHours:  { $sum: '$runningHours' },
+          tripCount:     { $sum: '$tripCount' },
+          vehicleCount:  { $sum: 1 },
+          maxSpeed:      { $max: '$maxSpeed' },
+          // Weighted average speed (avoid dividing by 0 in JS)
+          avgSpeedSum:   { $sum: { $multiply: ['$avgSpeed', '$rawPointCount'] } },
+          pointCount:    { $sum: '$rawPointCount' },
+        },
       },
-      { $sort: { "_id": 1 } }
+      {
+        $project: {
+          _id:           0,
+          date:          '$_id',
+          totalDistance: { $round: ['$totalDistance', 2] },
+          engineHours:   { $round: ['$engineHours',   2] },
+          idleHours:     { $round: ['$idleHours',     2] },
+          runningHours:  { $round: ['$runningHours',  2] },
+          tripCount:     1,
+          vehicleCount:  1,
+          maxSpeed:      { $round: ['$maxSpeed', 1] },
+          avgSpeed: {
+            $round: [
+              {
+                $cond: [
+                  { $gt: ['$pointCount', 0] },
+                  { $divide: ['$avgSpeedSum', '$pointCount'] },
+                  0,
+                ],
+              },
+              1,
+            ],
+          },
+        },
+      },
+      { $sort: { date: 1 } },
+    ];
+
+    const series = await DailySummary.aggregate(pipeline);
+
+    return res.json({ success: true, data: { days, series } });
+
+  } catch (err) {
+    logger.error('[AnalyticsCtrl] getFleetTrends: %s', err.message);
+    return sendError(res, 500, 'Failed to fetch fleet trends', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/analytics/vehicles/:id
+//   ?days=7        Rolling window (default 7)
+//   ?date=YYYY-MM-DD  Single day (overrides ?days)
+//   ?playback=true    Include GPS playback points
+//   ?page=1&limit=20  Pagination for trips
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Per-vehicle analytics.
+ *
+ * Response (rolling window):
+ * {
+ *   success: true,
+ *   data: {
+ *     vehicle: { id, imei, name },
+ *     analytics: { totalDistance, totalTrips, avgSpeed, maxSpeed,
+ *                  movingTime, engineHours, idleHours, period },
+ *     trips: { total, page, pageSize, trips: [...] }
+ *   }
+ * }
+ *
+ * Response (single day with ?date=YYYY-MM-DD):
+ * {
+ *   success: true,
+ *   data: {
+ *     vehicle: ...,
+ *     daily: { date, totalDistance, engineHours, ... },
+ *     playback?: { total, sampled, points: [...] }
+ *   }
+ * }
+ */
+async function getVehicleAnalytics(req, res) {
+  try {
+    const { id } = req.params;
+
+    if (!isValidObjectId(id)) {
+      return sendError(res, 400, 'Invalid vehicle id');
+    }
+
+    // Check vehicle exists
+    const vehicle = await Vehicle.findById(id)
+      .select('_id imei name plateNumber')
+      .lean();
+
+    if (!vehicle) {
+      return sendError(res, 404, 'Vehicle not found');
+    }
+
+    const dateParam = req.query.date;   // 'YYYY-MM-DD'
+
+    // ── Single-day mode ───────────────────────────────────────────────────────
+    if (dateParam) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+        return sendError(res, 400, 'date must be YYYY-MM-DD');
+      }
+
+      const [daily, trips] = await Promise.all([
+        AnalyticsService.getDailyAnalytics(id, dateParam),
+        AnalyticsService.getTrips(id, {
+          startDate: dateParam,
+          endDate:   dateParam,
+          limit:     50,
+          page:      1,
+        }),
+      ]);
+
+      const responseData = {
+        vehicle: {
+          id:          vehicle._id,
+          imei:        vehicle.imei,
+          name:        vehicle.name,
+          plateNumber: vehicle.plateNumber,
+        },
+        daily,
+        trips,
+      };
+
+      // Optionally include GPS playback points
+      if (req.query.playback === 'true') {
+        const maxPts = Math.min(parseInt(req.query.maxPoints ?? 500, 10), 2000);
+        responseData.playback = await AnalyticsService.getPlayback(id, dateParam, maxPts);
+      }
+
+      return res.json({ success: true, data: responseData });
+    }
+
+    // ── Rolling window mode ───────────────────────────────────────────────────
+    const days  = Math.min(Math.max(parseInt(req.query.days ?? 7, 10), 1), 90);
+    const page  = Math.max(parseInt(req.query.page  ?? 1,  10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit ?? 20, 10), 1), 100);
+
+    const [analytics, trips] = await Promise.all([
+      AnalyticsService.getVehicleAnalytics(id, { days }),
+      AnalyticsService.getTrips(id, { limit, page }),
     ]);
 
-    res.json({ success: true, data: trends });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    return res.json({
+      success: true,
+      data: {
+        vehicle: {
+          id:          vehicle._id,
+          imei:        vehicle.imei,
+          name:        vehicle.name,
+          plateNumber: vehicle.plateNumber,
+        },
+        analytics,
+        trips,
+      },
+    });
+
+  } catch (err) {
+    logger.error('[AnalyticsCtrl] getVehicleAnalytics [%s]: %s', req.params.id, err.message);
+    return sendError(res, 500, 'Failed to fetch vehicle analytics', err.message);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/analytics/vehicles/:id/playback
+//   ?date=YYYY-MM-DD (required)
+//   ?maxPoints=500
+// ─────────────────────────────────────────────────────────────────────────────
+async function getPlayback(req, res) {
+  try {
+    const { id }    = req.params;
+    const { date }  = req.query;
+
+    if (!isValidObjectId(id))         return sendError(res, 400, 'Invalid vehicle id');
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return sendError(res, 400, 'date (YYYY-MM-DD) is required');
+    }
+
+    const maxPoints = Math.min(parseInt(req.query.maxPoints ?? 500, 10), 2000);
+    const data      = await AnalyticsService.getPlayback(id, date, maxPoints);
+
+    return res.json({ success: true, data });
+  } catch (err) {
+    logger.error('[AnalyticsCtrl] getPlayback: %s', err.message);
+    return sendError(res, 500, 'Failed to fetch playback data', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/analytics/vehicles/:id/live
+// ─────────────────────────────────────────────────────────────────────────────
+async function getLiveStats(req, res) {
+  try {
+    const { id } = req.params;
+
+    if (!isValidObjectId(id)) return sendError(res, 400, 'Invalid vehicle id');
+
+    const data = await AnalyticsService.getLiveStats(id);
+    return res.json({ success: true, data });
+  } catch (err) {
+    logger.error('[AnalyticsCtrl] getLiveStats: %s', err.message);
+    return sendError(res, 500, 'Failed to fetch live stats', err.message);
+  }
+}
+
+module.exports = {
+  getFleetSummary,
+  getFleetTrends,
+  getVehicleAnalytics,
+  getPlayback,
+  getLiveStats,
 };
