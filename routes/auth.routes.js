@@ -77,7 +77,15 @@ router.post('/phone-login', async (req, res) => {
       return res.status(403).json({ success: false, message: 'Account is deactivated' });
     }
 
-    await User.findByIdAndUpdate(user._id, { lastLogin: new Date() });
+  await User.findByIdAndUpdate(user._id, { lastLogin: new Date() });
+
+    // ── Generate referral code if this user doesn't have one yet ──────────
+    if (!user.referralCode) {
+      const { customAlphabet } = require('nanoid');
+      const nanoid = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 6);
+      user.referralCode = 'NVIQ-' + nanoid();
+      await user.save();
+    }
 
     res.json({ 
       success: true, 
@@ -89,7 +97,7 @@ router.post('/phone-login', async (req, res) => {
   }
 });
 
-// ── GET /api/auth/me ──────────────────────────────────────────────────────────
+// ── GET /api/auth/me
 router.get('/me', protect, async (req, res) => {
   // User is already attached to req by the 'protect' middleware cache
   res.json({ success: true, data: _userPayload(req.user) });

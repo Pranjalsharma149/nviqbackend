@@ -67,11 +67,12 @@ async function boot() {
   app.use('/api/vehicles',  require('./routes/vehicles.routes'));
   app.use('/api/tracking',  require('./routes/tracking.routes'));
   app.use('/api/alerts',    require('./routes/alerts.routes'));
-  app.use('/api/analytics', require('./routes/analytics.routes'));  // ← updated
+  app.use('/api/analytics', require('./routes/analytics.routes'));
   app.use('/api/support',   require('./routes/support.routes'));
   app.use('/api/geofences', require('./routes/geofence.routes'));
   app.use('/api/trips',     require('./routes/trip.routes'));
   app.use('/api/referral',  require('./routes/referral.routes'));
+  app.use('/api/sync',      require('./routes/sync.routes'));       // ← ADDED
 
   // ── Socket events ───────────────────────────────────────────────────────────
   io.on('connection', (socket) => {

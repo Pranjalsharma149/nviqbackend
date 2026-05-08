@@ -9,23 +9,25 @@ const geofenceSchema = new mongoose.Schema({
   // ── Geometry ───────────────────────────────────────────────────────────────
   geometry: {
     type:        { type: String, enum: ['Polygon', 'Circle'], required: true },
-    coordinates: { type: Array },   // For Polygon: [[lng, lat], [lng, lat]...] (GeoJSON format)
-    center:      { latitude: Number, longitude: Number }, // For Circle
-    radius:      { type: Number },  // In meters, for Circle
+    coordinates: { type: Array },
+    center:      { latitude: Number, longitude: Number },
+    radius:      { type: Number },
   },
 
   // ── Targets ────────────────────────────────────────────────────────────────
-  // If empty, this geofence applies to the entire fleet (Global Fence)
-  vehicleIds: [{ 
-    type: mongoose.Schema.Types.ObjectId, 
-    ref: 'Vehicle',
-    index: true 
+  vehicleIds: [{
+    type:  mongoose.Schema.Types.ObjectId,
+    ref:   'Vehicle',
+    index: true,
   }],
 
   // ── Settings & Flags ───────────────────────────────────────────────────────
   alertOnEntry: { type: Boolean, default: true },
   alertOnExit:  { type: Boolean, default: true },
-  isActive:     { type: Boolean, default: true, index: true },
+
+  // FIX: removed index: true — geofenceSchema.index({ isActive: 1 }) below
+  // already creates this index. Both together = duplicate warning.
+  isActive: { type: Boolean, default: true },
 
   // ── Metadata ───────────────────────────────────────────────────────────────
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -34,13 +36,13 @@ const geofenceSchema = new mongoose.Schema({
   versionKey: false,
 });
 
-// ── Indexes for Scale ────────────────────────────────────────────────────────
+// ── Indexes ───────────────────────────────────────────────────────────────────
+// FIX: this is the ONLY index on isActive — field-level index: true removed above
 geofenceSchema.index({ isActive: 1 });
-geofenceSchema.index({ "geometry.type": 1 });
+geofenceSchema.index({ 'geometry.type': 1 });
 
-// ── Virtuals ─────────────────────────────────────────────────────────────────
-// Helper to identify "Global" fences without iterating vehicleIds
-geofenceSchema.virtual('isGlobal').get(function() {
+// ── Virtuals ──────────────────────────────────────────────────────────────────
+geofenceSchema.virtual('isGlobal').get(function () {
   return !this.vehicleIds || this.vehicleIds.length === 0;
 });
 

@@ -2,39 +2,48 @@
 
 const mongoose = require('mongoose');
 
+/**
+ * LocationPing — one GPS fix persisted by PersistentSyncService.recordGPSFixWithOdometer()
+ *
+ * This model is required by TripPlaybackController. If your project already
+ * has an equivalent model under a different name (e.g. GpsRecord, GPSFix),
+ * update the require() in TripPlaybackController.js to point at that file.
+ */
 const locationPingSchema = new mongoose.Schema({
-  vehicleId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle', required: true, index: true },
-  latitude:     { type: Number, required: true },
-  longitude:    { type: Number, required: true },
-  altitude:     { type: Number, default: 0 },
-  speed:        { type: Number, default: 0 },
-  heading:      { type: Number, default: 0 },
-  fuel:         { type: Number },
-  batteryLevel: { type: Number },
-  
-  // WanWay-compatible status strings
-  status:       { 
-    type: String, 
-    enum: ['moving', 'static', 'idle', 'parked', 'offline', 'unknown'], 
-    default: 'static' 
-  },
-  
-  gpsSignal:    { type: Boolean, default: true },
-  
-  // Primary timestamp for logic and TTL
-  timestamp:    { type: Date, default: Date.now, index: true },
+  vehicleId:        { type: String, required: true, index: true },
+  imei:             { type: String, index: true },
+
+  latitude:         { type: Number, required: true },
+  longitude:        { type: Number, required: true },
+  speed:            { type: Number, default: 0 },      // km/h
+  heading:          { type: Number, default: 0 },      // degrees
+  altitude:         { type: Number, default: 0 },      // metres
+  accuracy:         { type: Number, default: 0 },      // metres (GPS HDOP)
+  satellites:       { type: Number, default: 0 },
+
+  batteryVoltage:   { type: Number, default: 0 },      // volts
+  ignitionOn:       { type: Boolean, default: false },
+
+  // Primary time field — always use this for queries and sorting
+  gpsTime:          { type: Date, required: true, index: true },
+  deviceTime:       { type: Date },                    // server-receive time
+
+  address:          { type: String },                  // reverse-geocoded string
+
+  // Running totals at the moment of this fix (populated by PersistentSyncService)
+  serverOdometerKm: { type: Number, default: 0 },      // cumulative odometer
+  todayDistance:    { type: Number, default: 0 },      // distance today in km
+  engineHours:      { type: Number, default: 0 },      // engine-on hours today
+
+  source:           { type: String, default: 'wanway' },
 }, {
-  // Optimization: Disable versionKey and timestamps for high-write collections
+  timestamps: true,
   versionKey: false,
-  timestamps: false 
+  collection: 'locationpings',
 });
 
-// ── Compound index for History Playback (Flutter) ─────────────────────────────
-// Essential for O(1) retrieval of route history
-locationPingSchema.index({ vehicleId: 1, timestamp: -1 });
-
-// ── Auto-expire pings after 90 days (Scale-Safe) ──────────────────────────────
-// 90 days * 24h * 60m * 60s = 7,776,000
-locationPingSchema.index({ timestamp: 1 }, { expireAfterSeconds: 7776000 });
+// Compound indexes for the queries in TripPlaybackController
+locationPingSchema.index({ vehicleId: 1, gpsTime: -1 });
+locationPingSchema.index({ imei: 1, gpsTime: -1 });
 
 module.exports = mongoose.model('LocationPing', locationPingSchema);

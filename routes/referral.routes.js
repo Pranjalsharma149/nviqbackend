@@ -51,11 +51,22 @@ router.get('/my', protect, async (req, res) => {
 
     const ref = await getOrCreate(userId);
 
+    // Also pull live credit balance from User doc
+    const user = await User.findById(userId).select('credits');
+
     return res.json({
       success:        true,
       code:           ref.code,
       totalReferrals: ref.totalReferrals,
-      referredUsers:  ref.referredUsers,
+      totalCredits:   ref.totalCredits,
+      credits:        user?.credits ?? 0,       // ← shown as balance in UI
+      history:        ref.referredUsers.map(r => ({
+        phone:         r.phone
+          ? r.phone.slice(0, 3) + '****' + r.phone.slice(-2)
+          : '—',
+        joinedAt:      r.joinedAt,
+        creditsEarned: r.creditsEarned ?? 50,
+      })),
     });
   } catch (err) {
     console.error('GET /referral/my error:', err);
@@ -125,11 +136,28 @@ router.post('/apply', protect, async (req, res) => {
       return res.json({ success: true, message: 'Referral already credited' });
     }
 
-    ref.referredUsers.push({ user: newUserId, phone: phone ?? '' });
+    const CREDITS = 50; // change this value anytime
+
+    ref.referredUsers.push({ user: newUserId, phone: phone ?? '', creditsEarned: CREDITS });
     ref.totalReferrals += 1;
+    ref.totalCredits   += CREDITS;
     await ref.save();
 
-    return res.json({ success: true, message: 'Referral credited successfully' });
+    // Write credits to User doc so the UI can read it from /api/referral/my
+    await User.findByIdAndUpdate(referrerId, {
+      $inc: { credits: CREDITS },
+    });
+
+    // Push real-time update to referrer if they're online
+    if (global.io) {
+      global.io.to(referrerId).emit('credits_updated', {
+        creditsEarned: CREDITS,
+        totalCredits:  ref.totalCredits,
+        referredName:  phone ?? 'Someone',
+      });
+    }
+
+    return res.json({ success: true, message: 'Referral credited successfully', creditsEarned: CREDITS });
   } catch (err) {
     console.error('POST /referral/apply error:', err);
     return res.status(500).json({ success: false, message: err.message });

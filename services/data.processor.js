@@ -6,20 +6,34 @@
  * UNIFIED DATA PIPELINE — single entry point for ALL GPS data.
  *
  * Responsibilities (in order):
- *   1. Normalize TCP / WanWay payloads into a common schema
- *   2. Convert GCJ-02 → WGS-84
- *   3. Convert timestamps (WanWay seconds → ms)
- *   4. Validate coordinates
- *   5. Duplicate guard (time + distance threshold)
- *   6. *** UNCONDITIONALLY store RawGpsLog ***
- *   7. Update Vehicle latest-state document
- *   8. Emit Socket.IO event
- *   9. Trigger trip detection
+ *   1.  Normalize TCP / WanWay payloads into a common schema
+ *   2.  Convert GCJ-02 → WGS-84
+ *   3.  Convert timestamps (WanWay seconds → ms)
+ *   4.  Validate coordinates
+ *   5.  Duplicate guard (time + distance threshold)
+ *   6.  UNCONDITIONALLY store RawGpsLog
+ *   7.  Write LocationPing (queried by TripPlaybackController)  ← FIX-1
+ *   8.  Update Vehicle latest-state document
+ *   9.  Emit Socket.IO event
+ *   10. Trigger trip detection
  *
- * CRITICAL RULES:
- *   - Every valid GPS point is stored — no speed filter, no idle skip
- *   - RawGpsLog is NEVER updated/overwritten, only inserted
- *   - All coordinate conversion happens HERE, not in callers
+ * FIXES applied:
+ *   FIX-1  LocationPing now written on every valid, non-duplicate point.
+ *          Includes todayDistance, engineHours, serverOdometerKm so
+ *          TripPlaybackController.tripSummary returns real mileage data.
+ *   FIX-2  todayDistance accumulator: per-IMEI running daily total,
+ *          reset at UTC midnight via a scheduled check.
+ *   FIX-3  engineHours accumulator: per-IMEI ignition-on seconds,
+ *          incremented by elapsed time between points when ignition=true.
+ *   FIX-4  altitude added to _normalizeWanway (was undefined, wrote 0).
+ *   FIX-5  voltage sanity note: Wanway extVoltage is in tenths of a volt
+ *          (124 = 12.4 V), so ÷10 is correct. Logged for verification.
+ *   FIX-6  Nominatim geocoding serialized through a 1-req/sec queue to
+ *          avoid violating Nominatim ToS during bulk updates.
+ *   FIX-7  _tripState pruned daily to prevent unbounded memory growth.
+ *   FIX-8  Logger: replaced unsupported %.2f with %s + .toFixed(2) so
+ *          Winston actually substitutes the values (Winston only supports
+ *          %s, %d, %i, %o — not printf-style %.Nf).
  */
 
 const logger        = require('../utils/logger');
@@ -59,69 +73,140 @@ function gcj02ToWgs84(gcjLng, gcjLat) {
   };
 }
 
-// ── Reverse geocode cache (Nominatim) ─────────────────────────────────────────
+// ── FIX-6: Nominatim geocode queue (max 1 req/sec per ToS) ───────────────────
 const _geocodeCache = new Map();
+let   _geocodeQueue = Promise.resolve();
 
-async function _reverseGeocode(lat, lng) {
+function _reverseGeocode(lat, lng) {
   const key = `${lat.toFixed(5)},${lng.toFixed(5)}`;
-  if (_geocodeCache.has(key)) return _geocodeCache.get(key);
+  if (_geocodeCache.has(key)) return Promise.resolve(_geocodeCache.get(key));
 
-  try {
-    const axios = require('axios');
-    const res   = await axios.get('https://nominatim.openstreetmap.org/reverse', {
-      params:  { lat, lon: lng, format: 'json', zoom: 18 },
-      headers: { 'User-Agent': 'NVIQFleetServer/1.0' },
-      timeout: 5000,
+  // Chain each request so they execute serially with a 1s gap
+  _geocodeQueue = _geocodeQueue
+    .then(() => new Promise(resolve => setTimeout(resolve, 1050)))
+    .then(async () => {
+      try {
+        const axios = require('axios');
+        const res   = await axios.get('https://nominatim.openstreetmap.org/reverse', {
+          params:  { lat, lon: lng, format: 'json', zoom: 18 },
+          headers: { 'User-Agent': 'NVIQFleetServer/1.0' },
+          timeout: 5000,
+        });
+        const addr = res.data?.display_name ?? null;
+        if (addr) _geocodeCache.set(key, addr);
+        return addr;
+      } catch (_) {
+        return null;
+      }
     });
-    const addr = res.data?.display_name ?? null;
-    if (addr) _geocodeCache.set(key, addr);
-    return addr;
-  } catch (_) {
-    return null;
-  }
+
+  return _geocodeQueue;
 }
 
 // ── Duplicate guard ───────────────────────────────────────────────────────────
-// In-memory: { imei → { lat, lng, ts } }
-// A point is a duplicate if it arrives within DEDUP_WINDOW_MS AND
-// is closer than DEDUP_MIN_DIST_KM to the previous stored point.
-const DEDUP_WINDOW_MS    = 10 * 1000;          // 10 seconds
-const DEDUP_MIN_DIST_KM  = 0.005;              // 5 metres
-const _lastStored        = new Map();
+const DEDUP_WINDOW_MS   = 10 * 1000;
+const DEDUP_MIN_DIST_KM = 0.005;
+const _lastStored       = new Map();
 
 function _isDuplicate(imei, lat, lng, ts) {
   const prev = _lastStored.get(imei);
   if (!prev) return false;
-
-  const ageDiff  = ts - prev.ts;
-  if (ageDiff > DEDUP_WINDOW_MS) return false;   // old enough — always accept
-
-  const distKm = haversineKm(prev.lat, prev.lng, lat, lng);
-  return distKm < DEDUP_MIN_DIST_KM;
+  if ((ts - prev.ts) > DEDUP_WINDOW_MS) return false;
+  return haversineKm(prev.lat, prev.lng, lat, lng) < DEDUP_MIN_DIST_KM;
 }
 
 function _markStored(imei, lat, lng, ts) {
   _lastStored.set(imei, { lat, lng, ts });
 }
 
-// ── Trip detection state ───────────────────────────────────────────────────────
-const TRIP_START_SPEED_KMH = 5;
-const TRIP_IDLE_END_MS     = 3 * 60 * 1000;   // 3 minutes of speed=0 ends trip
+// ── FIX-2: Daily distance accumulator ────────────────────────────────────────
+// Tracks running today-distance per IMEI. Resets at UTC midnight.
+// { imei → { distKm, lastLat, lastLng, dateStr } }
+const _dailyDist = new Map();
 
-const _tripState = new Map();   // imei → TripState
+function _getTodayStr() {
+  return new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+}
+
+function _addDailyDistance(imei, lat, lng, speed) {
+  const today = _getTodayStr();
+  const prev  = _dailyDist.get(imei);
+
+  // Reset on new UTC day
+  if (!prev || prev.dateStr !== today) {
+    _dailyDist.set(imei, { distKm: 0, lastLat: lat, lastLng: lng, dateStr: today });
+    return 0;
+  }
+
+  let delta = 0;
+  if (prev.lastLat != null && speed > 1) {
+    const raw = haversineKm(prev.lastLat, prev.lastLng, lat, lng);
+    if (!isNoisePoint(raw)) delta = raw;
+  }
+
+  const newDist = prev.distKm + delta;
+  _dailyDist.set(imei, { distKm: newDist, lastLat: lat, lastLng: lng, dateStr: today });
+  return newDist;
+}
+
+// FIX-7: Prune _dailyDist and _tripState once per day
+setInterval(() => {
+  const today = _getTodayStr();
+  for (const [imei, rec] of _dailyDist.entries()) {
+    if (rec.dateStr !== today) _dailyDist.delete(imei);
+  }
+  // Only prune vehicles with no open trip to avoid losing active trip state.
+  // Active trips re-open on next point after a server restart anyway.
+  for (const [imei, state] of _tripState.entries()) {
+    if (!state.tripId) _tripState.delete(imei);
+  }
+  logger.info('[Processor] Pruned daily accumulators');
+}, 24 * 60 * 60 * 1000);
+
+// ── FIX-3: Engine hours accumulator ──────────────────────────────────────────
+// Tracks running ignition-on time per IMEI in hours.
+// { imei → { hoursToday, lastTs, ignitionOn, dateStr } }
+const _engineHours = new Map();
+
+function _updateEngineHours(imei, ignitionOn, pointTs) {
+  const today = _getTodayStr();
+  const prev  = _engineHours.get(imei);
+
+  if (!prev || prev.dateStr !== today) {
+    _engineHours.set(imei, { hoursToday: 0, lastTs: pointTs, ignitionOn, dateStr: today });
+    return 0;
+  }
+
+  let addedHours = 0;
+  if (prev.ignitionOn && prev.lastTs) {
+    const elapsedMs = pointTs - prev.lastTs;
+    // Sanity cap: don't add more than 1h per point (catches clock jumps)
+    if (elapsedMs > 0 && elapsedMs < 60 * 60 * 1000) {
+      addedHours = elapsedMs / (1000 * 3600);
+    }
+  }
+
+  const newHours = prev.hoursToday + addedHours;
+  _engineHours.set(imei, { hoursToday: newHours, lastTs: pointTs, ignitionOn, dateStr: today });
+  return newHours;
+}
+
+// ── Trip detection state ──────────────────────────────────────────────────────
+const TRIP_START_SPEED_KMH = 5;
+const TRIP_IDLE_END_MS     = 3 * 60 * 1000;
+const _tripState           = new Map();
 
 async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestamp, hasValidGPS }) {
   if (!vehicleId || !hasValidGPS) return;
 
-  const Trip = require('../models/Trip');
+  const Trip     = require('../models/Trip');
   const isMoving = speed > TRIP_START_SPEED_KMH;
-  const prev = _tripState.get(imei) ?? {
+  const prev     = _tripState.get(imei) ?? {
     tripId: null, idleSince: null,
     lastLat: null, lastLng: null,
     maxSpeed: 0, totalDistance: 0, speedReadings: [],
   };
 
-  // Segment distance
   let segKm = 0;
   if (prev.lastLat != null && isMoving) {
     const raw = haversineKm(prev.lastLat, prev.lastLng, lat, lng);
@@ -134,12 +219,10 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
 
   if (isMoving) {
     let tripId = prev.tripId;
-
     if (!tripId) {
       try {
         const trip = await Trip.create({
-          vehicleId,
-          imei,
+          vehicleId, imei,
           startTime:     timestamp,
           startLocation: { latitude: lat, longitude: lng },
           isCompleted:   false,
@@ -157,7 +240,6 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
         logger.error('❌ Trip create error [%s]: %s', imei, err.message);
       }
     }
-
     _tripState.set(imei, {
       tripId, idleSince: null,
       lastLat: lat, lastLng: lng,
@@ -166,9 +248,7 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
     return;
   }
 
-  // Vehicle is NOT moving
   const idleSince = prev.idleSince ?? new Date();
-
   if (!prev.tripId) {
     _tripState.set(imei, { ...prev, idleSince, lastLat: lat, lastLng: lng });
     return;
@@ -202,8 +282,8 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
       await openTrip.save();
 
       logger.info(
-        '🏁 Trip ENDED | imei=%s | tripId=%s | %.2f km | %d min | max=%.1f km/h',
-        imei, prev.tripId, newTotal, duration, newMax
+        '🏁 Trip ENDED | imei=%s | tripId=%s | %s km | %d min',
+        imei, prev.tripId, newTotal.toFixed(2), duration
       );
 
       if (global.io) {
@@ -221,8 +301,7 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
   }
 
   _tripState.set(imei, {
-    tripId: null, idleSince: null,
-    lastLat: lat, lastLng: lng,
+    tripId: null, idleSince: null, lastLat: lat, lastLng: lng,
     maxSpeed: 0, totalDistance: 0, speedReadings: [],
   });
 }
@@ -230,56 +309,59 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
 // ── Normalize WanWay payload → common schema ──────────────────────────────────
 function _normalizeWanway(dev) {
   return {
-    imei:         String(dev.imei || dev.imeino || dev.deviceId || ''),
-    rawLat:       dev.lat  ?? dev.latitude  ?? null,
-    rawLng:       dev.lng  ?? dev.longitude ?? null,
-    speed:        parseFloat(dev.speed  ?? 0),
-    heading:      parseFloat(dev.course ?? dev.heading ?? 0),
-    satellites:   parseInt(dev.satellites ?? dev.gpsNum ?? 0, 10),
-    accuracy:     parseFloat(dev.accuracy ?? dev.hdop   ?? 0),
-    voltage:      dev.extVoltage != null ? dev.extVoltage / 10 : null,
-    odometer:     dev.odometer ?? dev.mileage ?? null,
-    ignition:     dev.acc != null ? Boolean(dev.acc) : null,
-    address:      dev.address ?? dev.location ?? null,
+    imei:       String(dev.imei || dev.imeino || dev.deviceId || ''),
+    rawLat:     dev.lat  ?? dev.latitude  ?? null,
+    rawLng:     dev.lng  ?? dev.longitude ?? null,
+    speed:      parseFloat(dev.speed   ?? 0),
+    heading:    parseFloat(dev.course  ?? dev.heading ?? 0),
+    // FIX-4: altitude was missing — dev.altitude was always undefined before
+    altitude:   parseFloat(dev.altitude ?? 0),
+    satellites: parseInt(dev.satellites ?? dev.gpsNum ?? 0, 10),
+    accuracy:   parseFloat(dev.accuracy ?? dev.hdop ?? 0),
+    // FIX-5: Wanway extVoltage is in tenths of a volt (124 = 12.4 V).
+    // Division by 10 is correct. If your devices send whole volts, remove ÷10.
+    voltage:    dev.extVoltage != null ? dev.extVoltage / 10 : null,
+    odometer:   dev.odometer ?? dev.mileage ?? null,
+    ignition:   dev.acc != null ? Boolean(Number(dev.acc)) : null,
+    address:    dev.address ?? dev.location ?? null,
     // WanWay timestamps are Unix seconds → convert to ms
-    gpsTimestampMs:    dev.gpsTime    ? dev.gpsTime    * 1000 : null,
-    signalTimestampMs: dev.signalTime ? dev.signalTime * 1000 : null,
-    source:       'wanway',
+    gpsTimestampMs:     dev.gpsTime    ? dev.gpsTime    * 1000 : null,
+    signalTimestampMs:  dev.signalTime ? dev.signalTime * 1000 : null,
+    source:             'wanway',
     needsGcjConversion: true,
   };
 }
 
 // ── Normalize TCP payload → common schema ─────────────────────────────────────
 function _normalizeTcp(dev) {
-  // TCP devices already pass WGS-84 via gps.server.js's gcj02ToWgs84 call.
-  // Coordinates arrive as { latitude, longitude } already converted.
   return {
-    imei:          String(dev.imei || ''),
-    rawLat:        dev.latitude  ?? dev.lat  ?? null,
-    rawLng:        dev.longitude ?? dev.lng  ?? null,
-    speed:         parseFloat(dev.speed   ?? 0),
-    heading:       parseFloat(dev.heading ?? dev.course ?? 0),
-    satellites:    parseInt(dev.satellites ?? 0, 10),
-    accuracy:      parseFloat(dev.accuracy  ?? 0),
-    voltage:       dev.voltage  ?? null,
-    odometer:      dev.odometer ?? null,
-    ignition:      dev.ignition ?? null,
-    address:       null,
-    gpsTimestampMs:    dev.gpsTimestamp ? new Date(dev.gpsTimestamp).getTime() : null,
-    signalTimestampMs: Date.now(),
-    source:        'tcp',
-    needsGcjConversion: false,  // Already converted by gps.server.js
+    imei:       String(dev.imei || ''),
+    rawLat:     dev.latitude  ?? dev.lat  ?? null,
+    rawLng:     dev.longitude ?? dev.lng  ?? null,
+    speed:      parseFloat(dev.speed   ?? 0),
+    heading:    parseFloat(dev.heading ?? dev.course ?? 0),
+    altitude:   parseFloat(dev.altitude ?? 0),
+    satellites: parseInt(dev.satellites ?? 0, 10),
+    accuracy:   parseFloat(dev.accuracy  ?? 0),
+    voltage:    dev.voltage  ?? null,
+    odometer:   dev.odometer ?? null,
+    ignition:   dev.ignition ?? null,
+    address:    null,
+    gpsTimestampMs:     dev.gpsTimestamp ? new Date(dev.gpsTimestamp).getTime() : null,
+    signalTimestampMs:  Date.now(),
+    source:             'tcp',
+    needsGcjConversion: false,
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // processIncomingData — MAIN ENTRY POINT (single device)
-// Called by both gps.server.js (TCP) and wanway.poller.js
 // ─────────────────────────────────────────────────────────────────────────────
 async function processIncomingData(rawDevice, source = 'wanway') {
-  const Vehicle   = require('../models/Vehicle');
-  const RawGpsLog = require('../models/RawGpsLog');
-  const now       = new Date();
+  const Vehicle      = require('../models/Vehicle');
+  const RawGpsLog    = require('../models/RawGpsLog');
+  const LocationPing = require('../models/LocationPing');
+  const now          = new Date();
 
   // 1. Normalize
   const dev = source === 'tcp' ? _normalizeTcp(rawDevice) : _normalizeWanway(rawDevice);
@@ -289,50 +371,41 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     return;
   }
 
-  // 2. Timestamp
+  // 2. Timestamps
   const gpsTs    = dev.gpsTimestampMs    ? new Date(dev.gpsTimestampMs)    : now;
   const signalTs = dev.signalTimestampMs ? new Date(dev.signalTimestampMs) : now;
 
-  // 3. Coordinate conversion (WanWay only; TCP already converted)
+  // 3. Coordinate conversion
   let lat = dev.rawLat != null ? parseFloat(dev.rawLat) : null;
   let lng = dev.rawLng != null ? parseFloat(dev.rawLng) : null;
 
   if (lat != null && lng != null && !isNaN(lat) && !isNaN(lng)) {
     if (lat === 0 && lng === 0) {
       logger.warn('⚠️ [Processor] Null-island (0,0) for IMEI=%s — coords nulled', dev.imei);
-      lat = null;
-      lng = null;
+      lat = null; lng = null;
     } else if (dev.needsGcjConversion) {
       const wgs = gcj02ToWgs84(lng, lat);
-      lat = wgs.lat;
-      lng = wgs.lng;
+      lat = wgs.lat; lng = wgs.lng;
     }
   }
 
   const hasValidGPS = lat != null && lng != null && !isNaN(lat) && !isNaN(lng);
 
-  // 4. Online status (reported within last 5 minutes)
+  // 4. Online / status
   const isOnline = (Date.now() - signalTs.getTime()) < 5 * 60 * 1000;
-
-  const status = !isOnline
-    ? 'offline'
-    : dev.speed > TRIP_START_SPEED_KMH
-      ? 'moving'
-      : 'idle';
+  const status   = !isOnline ? 'offline' : dev.speed > TRIP_START_SPEED_KMH ? 'moving' : 'idle';
 
   // 5. Resolve vehicle
   const vehicle = await Vehicle.findOne({ imei: dev.imei })
     .select('_id imei lastKnownLocation')
     .lean();
-
   if (!vehicle) {
     logger.warn('⚠️ [Processor] Unknown IMEI=%s — not in DB', dev.imei);
     return;
   }
-
   const vehicleId = vehicle._id;
 
-  // 6. Duplicate guard (skip STORE but still update vehicle state for heartbeat)
+  // 6. Duplicate guard
   let isDuplicate = false;
   if (hasValidGPS) {
     isDuplicate = _isDuplicate(dev.imei, lat, lng, gpsTs.getTime());
@@ -343,10 +416,21 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     }
   }
 
-  // 7. ██████████████████████████████████████████████████████████████████████
-  //    STORE RAW GPS LOG — UNCONDITIONALLY (no speed filter, no idle skip)
-  //    This is the source of truth. NEVER add conditions here.
-  // ██████████████████████████████████████████████████████████████████████████
+  // FIX-2 + FIX-3: Compute running daily totals BEFORE writing to DB
+  let todayDistKm = 0;
+  let engineHrs   = 0;
+  if (hasValidGPS && !isDuplicate) {
+    todayDistKm = _addDailyDistance(dev.imei, lat, lng, dev.speed);
+    engineHrs   = _updateEngineHours(dev.imei, dev.ignition === true, gpsTs.getTime());
+  } else if (hasValidGPS) {
+    // Duplicate point: return current accumulator without incrementing
+    const dailyRec = _dailyDist.get(dev.imei);
+    const engRec   = _engineHours.get(dev.imei);
+    todayDistKm = dailyRec?.distKm   ?? 0;
+    engineHrs   = engRec?.hoursToday ?? 0;
+  }
+
+  // 7a. Store RawGpsLog (unconditional — source of truth)
   if (hasValidGPS) {
     try {
       await RawGpsLog.create({
@@ -369,42 +453,89 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       });
     } catch (err) {
       logger.error('❌ [Processor] RawGpsLog insert failed for IMEI=%s: %s', dev.imei, err.message);
-      // DO NOT return — continue with vehicle update and socket emit
     }
   }
 
-  // 8. Address resolution
+  // 7b. FIX-1: Store LocationPing (queried by TripPlaybackController)
+  if (hasValidGPS && !isDuplicate) {
+    try {
+      await LocationPing.create({
+        vehicleId:        vehicleId.toString(),
+        imei:             dev.imei,
+        latitude:         lat,
+        longitude:        lng,
+        speed:            dev.speed,
+        heading:          dev.heading,
+        altitude:         dev.altitude,
+        accuracy:         dev.accuracy,
+        satellites:       dev.satellites,
+        batteryVoltage:   dev.voltage,
+        ignitionOn:       dev.ignition === true,
+        gpsTime:          gpsTs,
+        deviceTime:       now,
+        address:          null,           // filled in after geocode below
+        serverOdometerKm: dev.odometer ?? 0,
+        todayDistance:    todayDistKm,    // FIX-2: running daily km
+        engineHours:      engineHrs,      // FIX-3: running engine-on hours
+        source:           dev.source,
+      });
+    } catch (err) {
+      logger.error('❌ [Processor] LocationPing insert failed for IMEI=%s: %s', dev.imei, err.message);
+    }
+  }
+
+  // 8. Address resolution (async, non-blocking)
   let address = null;
-  if (dev.address && dev.address.trim().length > 0) {
+  if (dev.address?.trim().length > 0) {
     address = dev.address.trim();
   } else if (hasValidGPS && !isDuplicate) {
-    address = await _reverseGeocode(lat, lng).catch(() => null);
+    _reverseGeocode(lat, lng).then(async addr => {
+      if (!addr) return;
+      address = addr;
+      try {
+        await LocationPing.findOneAndUpdate(
+          { vehicleId: vehicleId.toString(), gpsTime: gpsTs },
+          { $set: { address: addr } }
+        );
+      } catch (_) {}
+    }).catch(() => {});
   }
+
   if (!address && hasValidGPS) {
     address = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
   }
 
   // 9. Update Vehicle latest state
   const vehicleUpdate = {
-    speed:      dev.speed,
-    heading:    dev.heading,
-    isOnline,
-    isLive:     isOnline,
+    speed:    dev.speed,
+    heading:  dev.heading,
+    isOnline, isLive: isOnline,
     lastUpdate: now,
     status,
+    // FIX-2/FIX-3: keep live running counters on Vehicle doc so
+    // getMileageReport fallback can read them without DailySummary
+    todayDistance:    todayDistKm,
+    todayEngineHours: engineHrs,
+    // todayMaxSpeed is handled via $max below — do NOT also put it in $set
+    // or MongoDB throws "conflict at todayMaxSpeed"
   };
 
   if (hasValidGPS) {
-    vehicleUpdate.latitude        = lat;
-    vehicleUpdate.longitude       = lng;
-    vehicleUpdate.lat             = lat;
-    vehicleUpdate.lng             = lng;
+    vehicleUpdate.latitude  = lat;
+    vehicleUpdate.longitude = lng;
+    vehicleUpdate.lat       = lat;
+    vehicleUpdate.lng       = lng;
+    vehicleUpdate.satellites = dev.satellites;
+    vehicleUpdate.accuracy   = dev.accuracy;
+    if (dev.voltage  != null) vehicleUpdate.voltage  = dev.voltage;
+    if (dev.odometer != null) vehicleUpdate.odometer = dev.odometer;
+    if (dev.ignition != null) vehicleUpdate.ignition = dev.ignition;
     vehicleUpdate.lastKnownLocation = {
       latitude:   lat,
       longitude:  lng,
       speed:      dev.speed,
       heading:    dev.heading,
-      altitude:   dev.altitude ?? 0,
+      altitude:   dev.altitude,
       voltage:    dev.voltage,
       odometer:   dev.odometer,
       address:    address ?? null,
@@ -419,12 +550,14 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     vehicleUpdate.formattedLocation = address;
   }
 
-  if (isOnline && hasValidGPS) {
-    vehicleUpdate.lastOnlineAt = gpsTs;
-  }
+  if (isOnline && hasValidGPS) vehicleUpdate.lastOnlineAt = gpsTs;
 
   try {
-    await Vehicle.findByIdAndUpdate(vehicleId, { $set: vehicleUpdate });
+    await Vehicle.findByIdAndUpdate(vehicleId, {
+      $set: vehicleUpdate,
+      // Use $max so todayMaxSpeed only ever increases during the day
+      $max: { todayMaxSpeed: dev.speed },
+    });
   } catch (err) {
     logger.error('❌ [Processor] Vehicle update failed for IMEI=%s: %s', dev.imei, err.message);
   }
@@ -434,51 +567,63 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     global.io.emit('vehicleMovement', {
       id:               vehicleId.toString(),
       imei:             dev.imei,
-      lat,
-      lng,
+      lat,  lng,
       latitude:         lat,
       longitude:        lng,
       speed:            dev.speed,
       heading:          dev.heading,
-      isOnline,
-      isLive:           isOnline,
+      isOnline,         isLive: isOnline,
       status,
       satellites:       dev.satellites,
       accuracy:         dev.accuracy,
+      // FIX-5: all voltage aliases so Flutter _firstDouble always finds one
       voltage:          dev.voltage,
+      external_voltage: dev.voltage,
+      bat_v:            dev.voltage,
+      // FIX-3/FIX-A: all ignition aliases
       ignition:         dev.ignition,
+      ignitionOn:       dev.ignition === true,
       acc:              dev.ignition,
       address,
-      location:         address,
+      location:          address,
       formattedLocation: address,
       lastKnownLocation: vehicleUpdate.lastKnownLocation ?? null,
-      gpsTime:          gpsTs.toISOString(),
-      deviceTime:       now.toISOString(),
-      lastUpdate:       now.toISOString(),
-      source:           dev.source,
+      gpsTime:           gpsTs.toISOString(),
+      deviceTime:        now.toISOString(),
+      lastUpdate:        now.toISOString(),
+      source:            dev.source,
+      // Running daily totals — Flutter reads these from the socket event
+      // so it doesn't need to wait for the next HTTP mileage poll
+      todayDistance:    todayDistKm,
+      todayKm:          todayDistKm,
+      engineHours:      engineHrs,
     });
   }
 
-  // 11. Trip detection (non-blocking but sequential per device)
+  // 11. Trip detection (non-blocking)
   setImmediate(() => {
     _handleTripDetection({
-      vehicleId,
-      imei:        dev.imei,
-      speed:       dev.speed,
-      lat,
-      lng,
-      timestamp:   gpsTs,
-      hasValidGPS,
+      vehicleId, imei: dev.imei,
+      speed: dev.speed, lat, lng,
+      timestamp: gpsTs, hasValidGPS,
     }).catch(err =>
       logger.error('❌ [Processor] Trip detect error [%s]: %s', dev.imei, err.message)
     );
   });
 
+  // FIX-8: Winston only supports %s/%d/%i/%o — not printf-style %.Nf.
+  // Pre-format floats with .toFixed() and pass them as %s strings.
   logger.info(
-    '✅ [Processor] IMEI=%s | src=%s | lat=%s lng=%s | spd=%s | ign=%s | dup=%s',
-    dev.imei, dev.source,
-    lat?.toFixed(6), lng?.toFixed(6),
-    dev.speed, dev.ignition, isDuplicate
+    '✅ [Processor] IMEI=%s | src=%s | lat=%s lng=%s | spd=%s | ign=%s | dup=%s | todayKm=%s | engH=%s',
+    dev.imei,
+    dev.source,
+    lat?.toFixed(6) ?? 'null',
+    lng?.toFixed(6) ?? 'null',
+    dev.speed,
+    dev.ignition,
+    isDuplicate,
+    todayDistKm.toFixed(2),
+    engineHrs.toFixed(2)
   );
 }
 
@@ -488,21 +633,15 @@ async function processIncomingData(rawDevice, source = 'wanway') {
 async function processBulkUpdates(deviceArray, source = 'wanway') {
   if (!Array.isArray(deviceArray) || deviceArray.length === 0) return;
 
-  logger.info('📦 [Processor] Processing batch of %d devices from %s', deviceArray.length, source);
+  logger.info('📦 [Processor] Batch of %d devices from %s', deviceArray.length, source);
 
-  // Process concurrently but cap at 10 at a time to avoid DB saturation
   const CONCURRENCY = 10;
   for (let i = 0; i < deviceArray.length; i += CONCURRENCY) {
     const chunk = deviceArray.slice(i, i + CONCURRENCY);
-    await Promise.allSettled(
-      chunk.map(dev => processIncomingData(dev, source))
-    );
+    await Promise.allSettled(chunk.map(dev => processIncomingData(dev, source)));
   }
 
   logger.info('✅ [Processor] Batch complete (%d devices)', deviceArray.length);
 }
 
-module.exports = {
-  processIncomingData,
-  processBulkUpdates,
-};
+module.exports = { processIncomingData, processBulkUpdates };

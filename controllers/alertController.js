@@ -1,4 +1,3 @@
-// controllers/alertController.js
 'use strict';
 
 const Alert   = require('../models/Alert');
@@ -9,14 +8,13 @@ const Vehicle = require('../models/Vehicle');
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getAlerts = async (req, res) => {
   try {
-    const { limit = 50, acknowledged, vehicleId, priority, type, unreadOnly } = req.query;
+    const { limit = 50, vehicleId, priority, type, unreadOnly } = req.query;
 
     const query = {};
-    if (acknowledged  !== undefined) query.isAcknowledged = acknowledged === 'true';
-    if (vehicleId)                   query.vehicleId      = vehicleId;
+    if (vehicleId)              query.vehicleId = vehicleId;
     if (priority && ['low','medium','high','critical'].includes(priority)) query.priority = priority;
-    if (type)                        query.type           = type;
-    if (unreadOnly === 'true')       query.isRead         = false;
+    if (type)                   query.type    = type;
+    if (unreadOnly === 'true')  query.isRead  = false;
 
     const [alerts, total] = await Promise.all([
       Alert.find(query).sort({ timestamp: -1 }).limit(Math.min(parseInt(limit), 200)).lean(),
@@ -37,7 +35,7 @@ exports.getAlerts = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/alerts/unread-count  ← must be registered BEFORE /:id
+// GET /api/alerts/unread-count  ← registered BEFORE /:id in routes
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getUnreadCount = async (req, res) => {
   try {
@@ -62,28 +60,46 @@ exports.getAlertById = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PUT /api/alerts/:id/read  — mark single alert as read
+// ─────────────────────────────────────────────────────────────────────────────
+exports.markAsRead = async (req, res) => {
+  try {
+    const alert = await Alert.findByIdAndUpdate(
+      req.params.id,
+      { isRead: true },
+      { new: true }
+    );
+    if (!alert) return res.status(404).json({ success: false, message: 'Alert not found' });
+    res.json({ success: true, data: { ...alert.toObject(), id: alert.id } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PUT /api/alerts/:id/acknowledge
 // ─────────────────────────────────────────────────────────────────────────────
 exports.acknowledgeAlert = async (req, res) => {
   try {
+    const userId = req.user?._id ?? req.user?.id;
     const alert = await Alert.findByIdAndUpdate(
       req.params.id,
       {
-        isAcknowledged: true,
-        isRead:         true,
-        acknowledgedAt: new Date(),
-        acknowledgedBy: req.user._id,
+        isAcked:  true,
+        isRead:   true,
+        ackedAt:  new Date(),
+        ackedBy:  userId,
       },
       { new: true }
     );
 
     if (!alert) return res.status(404).json({ success: false, message: 'Alert not found' });
 
-    if (req.io) {
-      req.io.emit('alertAcknowledged', {
+    if (global.io) {
+      global.io.emit('alertAcknowledged', {
         alertId:        alert._id.toString(),
         acknowledgedBy: req.user.name,
-        acknowledgedAt: alert.acknowledgedAt,
+        acknowledgedAt: alert.ackedAt,
       });
     }
 
@@ -94,17 +110,18 @@ exports.acknowledgeAlert = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PUT /api/alerts/acknowledge-all  ← must be registered BEFORE /:id
+// PUT /api/alerts/acknowledge-all  ← registered BEFORE /:id in routes
 // ─────────────────────────────────────────────────────────────────────────────
 exports.acknowledgeAll = async (req, res) => {
   try {
+    const userId = req.user?._id ?? req.user?.id;
     const result = await Alert.updateMany(
-      { isAcknowledged: false },
-      { isAcknowledged: true, isRead: true, acknowledgedAt: new Date(), acknowledgedBy: req.user._id }
+      { isAcked: false },
+      { isAcked: true, isRead: true, ackedAt: new Date(), ackedBy: userId }
     );
 
-    if (req.io) {
-      req.io.emit('alertsBulkAcknowledged', {
+    if (global.io) {
+      global.io.emit('alertsBulkAcknowledged', {
         count:          result.modifiedCount,
         acknowledgedBy: req.user.name,
         acknowledgedAt: new Date(),
@@ -112,6 +129,18 @@ exports.acknowledgeAll = async (req, res) => {
     }
 
     res.json({ success: true, message: `${result.modifiedCount} alerts acknowledged` });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /api/alerts/mark-all-read
+// ─────────────────────────────────────────────────────────────────────────────
+exports.markAllRead = async (req, res) => {
+  try {
+    const result = await Alert.updateMany({ isRead: false }, { isRead: true });
+    res.json({ success: true, message: `${result.modifiedCount} alerts marked as read` });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -129,7 +158,7 @@ exports.deleteAlert = async (req, res) => {
     const alert = await Alert.findByIdAndDelete(req.params.id);
     if (!alert) return res.status(404).json({ success: false, message: 'Alert not found' });
 
-    if (req.io) req.io.emit('alertDeleted', { alertId: alert._id.toString() });
+    if (global.io) global.io.emit('alertDeleted', { alertId: alert._id.toString() });
 
     res.json({ success: true, message: 'Alert deleted' });
   } catch (error) {
@@ -146,23 +175,25 @@ exports.createTestAlert = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Disabled in production' });
     }
 
-    const { vehicleId, type = 'overspeed', priority = 'medium' } = req.body;
+    const { vehicleId, type = 'speeding', priority = 'medium' } = req.body;
     const vehicle = await Vehicle.findById(vehicleId);
     if (!vehicle) return res.status(404).json({ success: false, message: 'Vehicle not found' });
 
     const alert = await Alert.create({
       vehicleId:  vehicle._id,
+      imei:       vehicle.imei,
       vehicleReg: vehicle.vehicleReg,
       title:      `🧪 Test ${type} Alert`,
-      message:    `Test alert for ${vehicle.name}`,
-      type, priority,
+      message:    `Test alert for ${vehicle.name || vehicle.imei}`,
+      type,
+      priority,
       latitude:   vehicle.latitude,
       longitude:  vehicle.longitude,
       speed:      vehicle.speed,
       timestamp:  new Date(),
     });
 
-    if (req.io) req.io.emit('newAlert', { ...alert.toObject(), id: alert._id.toString() });
+    if (global.io) global.io.emit('newAlert', { ...alert.toObject(), id: alert._id.toString() });
 
     res.status(201).json({ success: true, message: 'Test alert created', data: { ...alert.toObject(), id: alert._id.toString() } });
   } catch (error) {
@@ -176,28 +207,15 @@ exports.createTestAlert = async (req, res) => {
 exports.purgeOldAlerts = async (req, res) => {
   try {
     if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Only admins can purge alerts',
-      });
+      return res.status(403).json({ success: false, message: 'Only admins can purge alerts' });
     }
 
-    // Example: delete alerts older than 30 days
-    const cutoffDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const days     = parseInt(req.query.days ?? '30', 10);
+    const cutoff   = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const result   = await Alert.deleteMany({ timestamp: { $lt: cutoff } });
 
-    const result = await Alert.deleteMany({
-      timestamp: { $lt: cutoffDate },
-    });
-
-    res.json({
-      success: true,
-      message: `${result.deletedCount} old alerts deleted`,
-    });
-
+    res.json({ success: true, message: `${result.deletedCount} alerts older than ${days} days deleted` });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    res.status(500).json({ success: false, message: error.message });
   }
 };

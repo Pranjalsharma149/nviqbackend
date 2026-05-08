@@ -22,15 +22,17 @@ const referralSchema = new mongoose.Schema(
     },
 
     // List of users who signed up using this code
-    referredUsers: [
+   referredUsers: [
       {
-        user:      { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-        joinedAt:  { type: Date, default: Date.now },
-        phone:     { type: String },
+        user:          { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        joinedAt:      { type: Date, default: Date.now },
+        phone:         { type: String },
+        creditsEarned: { type: Number, default: 50 }, // ← credits earned for this referral
       },
     ],
 
     totalReferrals: { type: Number, default: 0 },
+    totalCredits:   { type: Number, default: 0 },   // ← running credit balance
   },
   { timestamps: true, versionKey: false }
 );

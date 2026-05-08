@@ -21,6 +21,12 @@ const userSchema = new mongoose.Schema({
   resetPasswordToken:  { type: String, select: false },
   resetPasswordExpire: { type: Date,   select: false },
 
+  // ── Referral system ──────────────────────────────────────────────────────
+referralCode:    { type: String, unique: true, sparse: true },
+referredBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+referralApplied: { type: Boolean, default: false },
+credits:         { type: Number, default: 0 },
+credits:  { type: Number, default: 0 }, // ← referral credit balance shown in UI
   lastLogin: { type: Date },
 }, {
   timestamps: true,
