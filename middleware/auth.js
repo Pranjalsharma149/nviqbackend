@@ -5,7 +5,6 @@ const User   = require('../models/User');
 const logger = require('../utils/logger');
 
 // ── In-memory user cache ──────────────────────────────────────────────────────
-// Prevents DB bottleneck at high concurrency
 const userCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
@@ -22,19 +21,22 @@ function setCachedUser(id, user) {
 
 // ── protect middleware ────────────────────────────────────────────────────────
 // Accepts:
-//   1. Firebase ID Token  (from Flutter OTP login)
-//   2. NVIQ JWT           (from email/password login)
+//   1. NVIQ JWT           (from phone-login / email-password login)  ← checked FIRST
+//   2. Firebase ID Token  (legacy / direct Firebase auth)            ← fallback
 //   3. Dev mock token     (development only)
 exports.protect = async (req, res, next) => {
   const header = req.headers.authorization || '';
 
   // ── 1. Dev mock token ──────────────────────────────────────────────────────
+  // FIX: use a real ObjectId so MongoDB queries (e.g. referral lookup) don't fail
   if (process.env.NODE_ENV === 'development' && header.startsWith('Bearer mock_')) {
+    const mongoose = require('mongoose');
+    const mockId = new mongoose.Types.ObjectId('000000000000000000000001');
     req.user = {
-      _id:  'dev_user_001',
-      id:   'dev_user_001',
-      name: 'Dev User',
-      role: 'admin',
+      _id:    mockId,
+      id:     mockId.toString(),
+      name:   'Dev User',
+      role:   'admin',
       status: 'active',
     };
     return next();
@@ -46,40 +48,28 @@ exports.protect = async (req, res, next) => {
 
   const token = header.slice(7);
 
-  // ── 2. Try Firebase ID Token first ────────────────────────────────────────
+  // ── 2. Try NVIQ JWT FIRST ─────────────────────────────────────────────────
+  // Our own tokens are always verified first. Firebase tokens are the fallback.
+  // This avoids Firebase rejecting our JWT with auth/argument-error and
+  // blocking the request before we ever get to verify it ourselves.
   try {
-    const admin = require('firebase-admin');
-    if (admin.apps.length) {
-      const decoded = await admin.auth().verifyIdToken(token);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'nviq_secret_change_me');
 
-      // Look up user by phone or email from Firebase
-      const phoneOrEmail = decoded.phone_number || decoded.email;
-      let user = null;
+    // decoded.id is set by getSignedJwtToken() in User model
+    if (decoded && decoded.id) {
+      let user = getCachedUser(decoded.id);
 
-      if (decoded.phone_number) {
-        user = await User.findOne({ phone: decoded.phone_number })
-          .select('-password -resetPasswordToken -resetPasswordExpire')
-          .lean();
-      }
-      if (!user && decoded.email) {
-        user = await User.findOne({ email: decoded.email })
-          .select('-password -resetPasswordToken -resetPasswordExpire')
-          .lean();
-      }
-
-      // Auto-provision user on first Firebase login
       if (!user) {
-        const crypto = require('crypto');
-        user = await User.create({
-          name:     decoded.name || decoded.phone_number || 'Fleet User',
-          email:    decoded.email || `firebase_${decoded.uid}@nviq.app`,
-          phone:    decoded.phone_number || '',
-          password: crypto.randomBytes(16).toString('hex') + 'Aa1!',
-          role:     'fleet_manager',
-          status:   'active',
-        });
-        user = user.toObject();
-        logger.info('Auto-provisioned user for Firebase UID=%s', decoded.uid);
+        user = await User.findById(decoded.id)
+          .select('-password -resetPasswordToken -resetPasswordExpire')
+          .lean();
+
+        if (!user) {
+          return res.status(401).json({ success: false, message: 'User not found' });
+        }
+
+        user.id = user._id.toString();
+        setCachedUser(decoded.id, user);
       }
 
       if (user.status === 'suspended') {
@@ -89,39 +79,52 @@ exports.protect = async (req, res, next) => {
         return res.status(403).json({ success: false, message: 'Account is deactivated' });
       }
 
-      user.id = user._id.toString();
-      setCachedUser(user.id, user);
       req.user = user;
       return next();
     }
-  } catch (firebaseErr) {
-    // Not a Firebase token — fall through to JWT check
-    if (firebaseErr.code && firebaseErr.code.startsWith('auth/')) {
-      // It IS a Firebase token but it's invalid/expired
-      return res.status(401).json({ success: false, message: 'Firebase token invalid or expired' });
+  } catch (jwtErr) {
+    // TokenExpiredError = was our token but it expired → tell user to re-login
+    if (jwtErr.name === 'TokenExpiredError') {
+      return res.status(401).json({ success: false, message: 'Token expired — please log in again' });
     }
-    // Otherwise it's just not a Firebase token — try JWT next
+    // JsonWebTokenError = not our token (probably Firebase) → fall through
   }
 
-  // ── 3. Try NVIQ JWT ────────────────────────────────────────────────────────
+  // ── 3. Try Firebase ID Token (fallback) ───────────────────────────────────
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'nviq_secret_change_me');
+    const admin = require('firebase-admin');
+    if (!admin.apps.length) {
+      return res.status(401).json({ success: false, message: 'Invalid token' });
+    }
 
-    // Try cache first
-    let user = getCachedUser(decoded.id);
+    const decoded = await admin.auth().verifyIdToken(token);
 
-    // Fallback to DB
-    if (!user) {
-      user = await User.findById(decoded.id)
+    let user = null;
+
+    if (decoded.phone_number) {
+      user = await User.findOne({ phone: decoded.phone_number })
         .select('-password -resetPasswordToken -resetPasswordExpire')
         .lean();
+    }
+    if (!user && decoded.email) {
+      user = await User.findOne({ email: decoded.email })
+        .select('-password -resetPasswordToken -resetPasswordExpire')
+        .lean();
+    }
 
-      if (!user) {
-        return res.status(401).json({ success: false, message: 'User not found' });
-      }
-
-      user.id = user._id.toString();
-      setCachedUser(decoded.id, user);
+    // Auto-provision user on first Firebase login
+    if (!user) {
+      const crypto = require('crypto');
+      user = await User.create({
+        name:     decoded.name || decoded.phone_number || 'Fleet User',
+        email:    decoded.email || `firebase_${decoded.uid}@nviq.app`,
+        phone:    decoded.phone_number || '',
+        password: crypto.randomBytes(16).toString('hex') + 'Aa1!',
+        role:     'fleet_manager',
+        status:   'active',
+      });
+      user = user.toObject();
+      logger.info('Auto-provisioned user for Firebase UID=%s', decoded.uid);
     }
 
     if (user.status === 'suspended') {
@@ -131,14 +134,14 @@ exports.protect = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Account is deactivated' });
     }
 
+    user.id = user._id.toString();
+    setCachedUser(user.id, user);
     req.user = user;
     return next();
 
-  } catch (jwtErr) {
-    const msg = jwtErr.name === 'TokenExpiredError'
-      ? 'Token expired — please log in again'
-      : 'Invalid token';
-    return res.status(401).json({ success: false, message: msg });
+  } catch (firebaseErr) {
+    logger.warn('Firebase token verification failed: %s', firebaseErr.message);
+    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
   }
 };
 
@@ -157,6 +160,5 @@ exports.requireRole = (...roles) => (req, res, next) => {
 exports.optionalAuth = async (req, res, next) => {
   const header = req.headers.authorization || '';
   if (!header.startsWith('Bearer ')) return next();
-  // Reuse protect logic but swallow errors
   exports.protect(req, res, (err) => next());
 };
