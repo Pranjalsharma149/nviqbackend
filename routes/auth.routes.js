@@ -20,6 +20,16 @@ function _userPayload(user) {
   };
 }
 
+// ── Shared referral code generator ────────────────────────────────────────────
+async function _ensureReferralCode(user) {
+  if (!user.referralCode) {
+    const { customAlphabet } = require('nanoid');
+    const nanoid = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 6);
+    user.referralCode = 'NVIQ-' + nanoid();
+    await user.save();
+  }
+}
+
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
 router.post('/login', async (req, res) => {
   try {
@@ -29,7 +39,7 @@ router.post('/login', async (req, res) => {
     }
 
     const user = await User.findOne({ email: email.toLowerCase() }).select('+password');
-    
+
     if (!user || !(await user.matchPassword(password))) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
@@ -40,10 +50,10 @@ router.post('/login', async (req, res) => {
 
     await User.findByIdAndUpdate(user._id, { lastLogin: new Date() });
 
-    res.json({ 
-      success: true, 
-      token: user.getSignedJwtToken(), 
-      data: _userPayload(user) 
+    res.json({
+      success: true,
+      token:   user.getSignedJwtToken(),
+      data:    _userPayload(user),
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -66,10 +76,10 @@ router.post('/phone-login', async (req, res) => {
       user = await User.create({
         name:     name || `Fleet-Manager-${digits.slice(-4)}`,
         email:    `${digits}@nviq.app`,
-        password: firebaseUid || `nviq_${digits}`, // Fallback password
+        password: firebaseUid || `nviq_${digits}`,
         phone:    digits,
         role:     'fleet_manager',
-        status:   'active'
+        status:   'active',
       });
     }
 
@@ -77,29 +87,73 @@ router.post('/phone-login', async (req, res) => {
       return res.status(403).json({ success: false, message: 'Account is deactivated' });
     }
 
-  await User.findByIdAndUpdate(user._id, { lastLogin: new Date() });
+    await User.findByIdAndUpdate(user._id, { lastLogin: new Date() });
+    await _ensureReferralCode(user);
 
-    // ── Generate referral code if this user doesn't have one yet ──────────
-    if (!user.referralCode) {
-      const { customAlphabet } = require('nanoid');
-      const nanoid = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 6);
-      user.referralCode = 'NVIQ-' + nanoid();
-      await user.save();
-    }
-
-    res.json({ 
-      success: true, 
-      token: user.getSignedJwtToken(), 
-      data: _userPayload(user) 
+    res.json({
+      success: true,
+      token:   user.getSignedJwtToken(),
+      data:    _userPayload(user),
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
 });
 
-// ── GET /api/auth/me
+// ── POST /api/auth/verify-otp ─────────────────────────────────────────────────
+// Called by the mobile app after Firebase Phone Auth verifies the OTP.
+// Expects: { phone, firebaseUid, name? }
+router.post('/verify-otp', async (req, res) => {
+  try {
+    const { phone, firebaseUid, name } = req.body;
+
+    if (!phone || !firebaseUid) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone and firebaseUid are required',
+      });
+    }
+
+    const digits = phone.replace(/\D/g, '');
+
+    let user = await User.findOne({
+      $or: [{ phone }, { phone: digits }, { email: `${digits}@nviq.app` }],
+    });
+
+    if (!user) {
+      const { customAlphabet } = require('nanoid');
+      const nanoid = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 6);
+
+      user = await User.create({
+        name:         name || `Fleet-Manager-${digits.slice(-4)}`,
+        email:        `${digits}@nviq.app`,
+        password:     firebaseUid,
+        phone:        digits,
+        role:         'fleet_manager',
+        status:       'active',
+        referralCode: 'NVIQ-' + nanoid(),
+      });
+    }
+
+    if (user.status !== 'active') {
+      return res.status(403).json({ success: false, message: 'Account is deactivated' });
+    }
+
+    await User.findByIdAndUpdate(user._id, { lastLogin: new Date() });
+    await _ensureReferralCode(user);
+
+    res.json({
+      success: true,
+      token:   user.getSignedJwtToken(),
+      data:    _userPayload(user),
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── GET /api/auth/me ──────────────────────────────────────────────────────────
 router.get('/me', protect, async (req, res) => {
-  // User is already attached to req by the 'protect' middleware cache
   res.json({ success: true, data: _userPayload(req.user) });
 });
 
