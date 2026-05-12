@@ -7,6 +7,8 @@ const GPSEngine    = require('./geofenceController');
 const logger       = require('../utils/logger');
 
 // ── GCJ-02 → WGS-84 ──────────────────────────────────────────────────────────
+// This is not neccessory because the Wanway GPS is already providing wgs84 coordinates but gcj02 is required for other gps devices basically it is used in China. and It adds a purposeful random offset (shift) to GPS coordinates for security reasons
+
 function gcj02ToWgs84(gcjLng, gcjLat) {
   const a  = 6378245.0;
   const ee = 0.00669342162296594323;
@@ -277,8 +279,9 @@ exports.batchUpdate = async (req, res) => {
 
       let lat = null, lng = null;
       if (rawLat != null && rawLng != null && !isNaN(rawLat) && !isNaN(rawLng)) {
-        const wgs = gcj02ToWgs84(rawLng, rawLat);
-        lat = wgs.lat; lng = wgs.lng;
+        // const wgs = gcj02ToWgs84(rawLng, rawLat);
+        lat =rawLat; 
+        lng = rawLng;
       }
 
       const hasValidGPS = isValidCoord(lat, lng);
