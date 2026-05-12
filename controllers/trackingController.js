@@ -277,8 +277,9 @@ exports.batchUpdate = async (req, res) => {
 
       let lat = null, lng = null;
       if (rawLat != null && rawLng != null && !isNaN(rawLat) && !isNaN(rawLng)) {
-        const wgs = gcj02ToWgs84(rawLng, rawLat);
-        lat = wgs.lat; lng = wgs.lng;
+        // const wgs = gcj02ToWgs84(rawLng, rawLat);
+        lat =rawLat; 
+        lng = rawLng;
       }
 
       const hasValidGPS = isValidCoord(lat, lng);

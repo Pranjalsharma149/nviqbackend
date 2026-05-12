@@ -197,7 +197,9 @@ function handleGt06Message(msg, socket, remoteAddr, onImei) {
       if (!imei || rawLat == null || rawLng == null) break;
 
       // Convert GCJ-02 → WGS-84 HERE so processPosition gets real coordinates
-      const { lat, lng } = gcj02ToWgs84(parseFloat(rawLng), parseFloat(rawLat));
+      // const { lat, lng } = gcj02ToWgs84(parseFloat(rawLng), parseFloat(rawLat));
+      const lat = parseFloat(rawLat);
+      const lng = parseFloat(rawLng);
       const gpsTimestamp  = msg.gpsTime ?? msg.dateTime ?? msg.timestamp ?? null;
 
       processPosition({
@@ -229,7 +231,9 @@ function handleGt06Message(msg, socket, remoteAddr, onImei) {
       const imei  = msg.imei || msg.deviceId;
       logger.warn('🚨 [TCP] Alarm IMEI=%s type=%s', imei, msg.alarmType ?? 'unknown');
       if (msg.latitude && msg.longitude && imei) {
-        const { lat, lng } = gcj02ToWgs84(parseFloat(msg.longitude), parseFloat(msg.latitude));
+        // const { lat, lng } = gcj02ToWgs84(parseFloat(msg.longitude), parseFloat(msg.latitude));
+        const lat = parseFloat(msg.latitude);
+        const lng = parseFloat(msg.longitude);
         processPosition({
           imei: String(imei), lat, lng,
           speed: parseFloat(msg.speed ?? 0),
