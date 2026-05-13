@@ -11,8 +11,9 @@ const rateLimit  = require('express-rate-limit');
 const connectDB  = require('./config/db');
 const seedDevices = require('./scripts/seedDevices');
 const logger     = require('./utils/logger');
-const wanwayPoller     = require('./services/wanway.poller');
-const dailySummaryJob  = require('./cron/dailySummary.job');
+const wanwayPoller      = require('./services/wanway.poller');
+const multitrackPoller  = require('./services/multitrack.poller');   // ← NEW
+const dailySummaryJob   = require('./cron/dailySummary.job');
 
 // ── Firebase Admin ─────────────────────────────────────────────────────────────
 try {
@@ -72,7 +73,7 @@ async function boot() {
   app.use('/api/geofences', require('./routes/geofence.routes'));
   app.use('/api/trips',     require('./routes/trip.routes'));
   app.use('/api/referral',  require('./routes/referral.routes'));
-  app.use('/api/sync',      require('./routes/sync.routes'));       // ← ADDED
+  app.use('/api/sync',      require('./routes/sync.routes'));
 
   // ── Socket events ───────────────────────────────────────────────────────────
   io.on('connection', (socket) => {
@@ -90,10 +91,18 @@ async function boot() {
   const GPS_PORT = parseInt(process.env.GPS_TCP_PORT ?? '5001', 10);
   require('./services/gps.server').startGpsServer(GPS_PORT);
 
-  // B. WanWay cloud poller
+  // B. WanWay cloud poller — UNCHANGED, existing customers unaffected
   wanwayPoller.start();
 
-  // C. Nightly daily-summary cron (00:05 UTC)
+  // C. MultiTrackVTS poller — NEW, runs in parallel with Wanway
+  //    Only starts if MULTITRACK_TOKEN is set in .env
+  if (process.env.MULTITRACK_TOKEN) {
+    multitrackPoller.start();
+  } else {
+    logger.warn('⚠️  MULTITRACK_TOKEN not set — MultiTrackVTS poller skipped');
+  }
+
+  // D. Nightly daily-summary cron (00:05 UTC)
   dailySummaryJob.start();
 
   // ── HTTP server ─────────────────────────────────────────────────────────────

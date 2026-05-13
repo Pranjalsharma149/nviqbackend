@@ -5,8 +5,9 @@
  * Single Source of Truth for fleet configuration.
  *
  * Protocols:
- *   PT06      → connects via IOP GPS (WanWay platform) — polled every 30s
- *   GT06      → connects directly via TCP port 5001
+ *   PT06        → connects via IOP GPS (WanWay platform) — polled every 30s
+ *   GT06        → connects directly via TCP port 5001
+ *   MULTITRACK  → connects via MultiTrackVTS platform — polled every 60s
  *
  * Scalability Note: For 20k+ devices, move this registry into MongoDB
  * with an index on IMEI.
@@ -28,9 +29,9 @@ const REGISTERED_DEVICES = [
   },
   {
     imei:         '868720064616620',
-    vehicleReg:   'DEVICE2',           // ← Replace with real plate number
+    vehicleReg:   'DEVICE2',
     name:         'Vehicle Tracker 2',
-    type:         'car',               // ← Update if truck/bike
+    type:         'car',
     protocol:     'PT06',              // Via IOP GPS platform
     pocName:      '',
     pocContact:   '',
@@ -43,9 +44,9 @@ const REGISTERED_DEVICES = [
   // ── Direct TCP Devices (GT06 protocol → port 5001) ─────────────────────────
   {
     imei:         '866221070653410',
-    vehicleReg:   'DEVICE3',           // ← Replace with real plate number
+    vehicleReg:   'DEVICE3',
     name:         'Vehicle Tracker 3',
-    type:         'car',               // ← Update if truck/bike
+    type:         'car',
     protocol:     'GT06',              // Direct TCP — PRIME09
     pocName:      '',
     pocContact:   '',
@@ -55,15 +56,43 @@ const REGISTERED_DEVICES = [
   },
   {
     imei:         '867010072155188',
-    vehicleReg:   'DEVICE4',           // ← Replace with real plate number
+    vehicleReg:   'DEVICE4',
     name:         'Vehicle Tracker 4',
-    type:         'car',               // ← Update if truck/bike
+    type:         'car',
     protocol:     'GT06',              // Direct TCP — VL149
     pocName:      '',
     pocContact:   '',
     speedLimit:   80,
     fuelAlert:    15,
     battAlert:    20,
+  },
+
+  // ── MultiTrackVTS Platform Devices (AIS 140 VLTD) ──────────────────────────
+  {
+    // ⚠️  NOTE: MultiTrackVTS identifies vehicles by chassis number (vehicleNumber),
+    //     NOT by IMEI. We store the chassis number in the `imei` field so it flows
+    //     through data.processor.js without any schema changes.
+    //     Actual IMEI: 860187062376870 (3GBT-140 device IMEI from fitment cert)
+    imei:         'MA3SFM61STA461818',  // ← Chassis No. as stored on MultiTrackVTS platform
+    // Note: Fitment cert shows MA3BNC62SRC767065 but MultiTrackVTS uses MA3SFM61STA461818
+    vehicleReg:   'GJ15AX0695',        // ← RTO registration number
+    name:         'HANSABEN C PATEL - Tour M CNG',
+    type:         'car',
+    protocol:     'MULTITRACK',         // Via MultiTrackVTS platform
+    pocName:      'HANSABEN C PATEL',
+    pocContact:   '+919904146665',
+    speedLimit:   80,
+    fuelAlert:    15,
+    battAlert:    20,
+
+    // AIS 140 specific metadata (for reference / future use)
+    deviceMake:   '3GB TECHNOLOGY PVT LTD',
+    deviceModel:  '3GBT-140',
+    deviceImei:   '860187062376870',
+    deviceSerial: '3GBT01A022600013674',
+    simIccid:     '8991102305852005166',
+    fitmentDate:  '2026-05-02',
+    rtoCodes:     'GJ15',
   },
 
 ];
@@ -83,7 +112,7 @@ module.exports = {
   getByIMEI:     (imei) => BY_IMEI.get(String(imei)) || null,
   getByReg:      (reg)  => BY_REG.get(String(reg))   || null,
   isKnownDevice: (imei) => BY_IMEI.has(String(imei)),
-  getAllIMEIs:   ()      => Array.from(BY_IMEI.keys()),
+  getAllIMEIs:    ()     => Array.from(BY_IMEI.keys()),
 
   // Returns only IMEIs that use the IOP GPS platform (polled via WanWay)
   getIopIMEIs: () => REGISTERED_DEVICES
@@ -94,6 +123,15 @@ module.exports = {
   getTcpIMEIs: () => REGISTERED_DEVICES
     .filter(d => d.protocol === 'GT06')
     .map(d => d.imei),
+
+  // Returns only devices on MultiTrackVTS platform
+  getMultitrackDevices: () => REGISTERED_DEVICES
+    .filter(d => d.protocol === 'MULTITRACK'),
+
+  // Returns chassis numbers used as IDs by MultiTrackVTS
+  getMultitrackIMEIs: () => REGISTERED_DEVICES
+    .filter(d => d.protocol === 'MULTITRACK')
+    .map(d => d.imei),
 };
 
 /**
@@ -101,10 +139,14 @@ module.exports = {
  * DEVICE SUMMARY
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Device 1 — PT06      | IMEI: 356218606576971 | Via WanWay IOP GPS
- * Device 2 — PT06 lite | IMEI: 868720064616620 | Via WanWay IOP GPS
- * Device 3 — PRIME09   | IMEI: 866221070653410 | Direct TCP port 5001
- * Device 4 — VL149     | IMEI: 867010072155188 | Direct TCP port 5001
+ * Device 1 — PT06        | IMEI: 356218606576971    | Via WanWay IOP GPS
+ * Device 2 — PT06 lite   | IMEI: 868720064616620    | Via WanWay IOP GPS
+ * Device 3 — PRIME09     | IMEI: 866221070653410    | Direct TCP port 5001
+ * Device 4 — VL149       | IMEI: 867010072155188    | Direct TCP port 5001
+ * Device 5 — 3GBT-140    | IMEI: 860187062376870    | Via MultiTrackVTS (AIS 140)
+ *             Chassis:     MA3SFM61STA461818  (as stored on MultiTrackVTS)
+ *             Reg:         GJ15AX0695
+ *             Owner:       HANSABEN C PATEL
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * CONFIGURING DIRECT TCP DEVICES (PRIME09 & VL149)
