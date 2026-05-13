@@ -1,39 +1,13 @@
 'use strict';
 
 /**
- * services/data.processor.js
+ * services/data.processor.js — FIXED VERSION
  *
- * UNIFIED DATA PIPELINE — single entry point for ALL GPS data.
- *
- * Responsibilities (in order):
- *   1.  Normalize TCP / WanWay payloads into a common schema
- *   2.  Convert GCJ-02 → WGS-84
- *   3.  Convert timestamps (WanWay seconds → ms)
- *   4.  Validate coordinates
- *   5.  Duplicate guard (time + distance threshold)
- *   6.  UNCONDITIONALLY store RawGpsLog
- *   7.  Write LocationPing (queried by TripPlaybackController)  ← FIX-1
- *   8.  Update Vehicle latest-state document
- *   9.  Emit Socket.IO event
- *   10. Trigger trip detection
- *
- * FIXES applied:
- *   FIX-1  LocationPing now written on every valid, non-duplicate point.
- *          Includes todayDistance, engineHours, serverOdometerKm so
- *          TripPlaybackController.tripSummary returns real mileage data.
- *   FIX-2  todayDistance accumulator: per-IMEI running daily total,
- *          reset at UTC midnight via a scheduled check.
- *   FIX-3  engineHours accumulator: per-IMEI ignition-on seconds,
- *          incremented by elapsed time between points when ignition=true.
- *   FIX-4  altitude added to _normalizeWanway (was undefined, wrote 0).
- *   FIX-5  voltage sanity note: Wanway extVoltage is in tenths of a volt
- *          (124 = 12.4 V), so ÷10 is correct. Logged for verification.
- *   FIX-6  Nominatim geocoding serialized through a 1-req/sec queue to
- *          avoid violating Nominatim ToS during bulk updates.
- *   FIX-7  _tripState pruned daily to prevent unbounded memory growth.
- *   FIX-8  Logger: replaced unsupported %.2f with %s + .toFixed(2) so
- *          Winston actually substitutes the values (Winston only supports
- *          %s, %d, %i, %o — not printf-style %.Nf).
+ * FIXES APPLIED:
+ *   FIX-1: needsGcjConversion = false for Wanway (they send WGS-84 already)
+ *   FIX-2: Ignition field NOW included in socket.io emit
+ *   FIX-3: Daily distance reset uses LOCAL timezone, not UTC
+ *   FIX-4: Engine hours checks CURRENT ignition, not previous
  */
 
 const logger        = require('../utils/logger');
@@ -119,13 +93,17 @@ function _markStored(imei, lat, lng, ts) {
   _lastStored.set(imei, { lat, lng, ts });
 }
 
-// ── FIX-2: Daily distance accumulator ────────────────────────────────────────
-// Tracks running today-distance per IMEI. Resets at UTC midnight.
-// { imei → { distKm, lastLat, lastLng, dateStr } }
+// ── FIX-2 + FIX-3: Daily distance accumulator ────────────────────────────────
 const _dailyDist = new Map();
 
+// ✅ FIX-3: Get TODAY STRING in LOCAL timezone, not UTC
 function _getTodayStr() {
-  return new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+  const now = new Date();
+  // Use local timezone, not UTC
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 function _addDailyDistance(imei, lat, lng, speed) {
@@ -155,19 +133,16 @@ setInterval(() => {
   for (const [imei, rec] of _dailyDist.entries()) {
     if (rec.dateStr !== today) _dailyDist.delete(imei);
   }
-  // Only prune vehicles with no open trip to avoid losing active trip state.
-  // Active trips re-open on next point after a server restart anyway.
   for (const [imei, state] of _tripState.entries()) {
     if (!state.tripId) _tripState.delete(imei);
   }
   logger.info('[Processor] Pruned daily accumulators');
 }, 24 * 60 * 60 * 1000);
 
-// ── FIX-3: Engine hours accumulator ──────────────────────────────────────────
-// Tracks running ignition-on time per IMEI in hours.
-// { imei → { hoursToday, lastTs, ignitionOn, dateStr } }
+// ── Engine hours accumulator ──────────────────────────────────────────────────
 const _engineHours = new Map();
 
+// ✅ FIX-4: Check CURRENT ignition state, not previous
 function _updateEngineHours(imei, ignitionOn, pointTs) {
   const today = _getTodayStr();
   const prev  = _engineHours.get(imei);
@@ -178,7 +153,7 @@ function _updateEngineHours(imei, ignitionOn, pointTs) {
   }
 
   let addedHours = 0;
-  if (prev.ignitionOn && prev.lastTs) {
+  if (ignitionOn && prev.lastTs) {  // ✅ FIX-4: Check CURRENT ignitionOn, not prev.ignitionOn
     const elapsedMs = pointTs - prev.lastTs;
     // Sanity cap: don't add more than 1h per point (catches clock jumps)
     if (elapsedMs > 0 && elapsedMs < 60 * 60 * 1000) {
@@ -309,26 +284,37 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
 // ── Normalize WanWay payload → common schema ──────────────────────────────────
 function _normalizeWanway(dev) {
   return {
-    imei:       String(dev.imei || dev.imeino || dev.deviceId || ''),
+    // Identity
+    imei: String(dev.imei || dev.imeino || dev.deviceId || ''),
+
+    // Coordinates
     rawLat:     dev.lat  ?? dev.latitude  ?? null,
     rawLng:     dev.lng  ?? dev.longitude ?? null,
+
+    // Motion
     speed:      parseFloat(dev.speed   ?? 0),
     heading:    parseFloat(dev.course  ?? dev.heading ?? 0),
-    // FIX-4: altitude was missing — dev.altitude was always undefined before
+
+    // Vehicle info
     altitude:   parseFloat(dev.altitude ?? 0),
     satellites: parseInt(dev.satellites ?? dev.gpsNum ?? 0, 10),
     accuracy:   parseFloat(dev.accuracy ?? dev.hdop ?? 0),
-    // FIX-5: Wanway extVoltage is in tenths of a volt (124 = 12.4 V).
-    // Division by 10 is correct. If your devices send whole volts, remove ÷10.
     voltage:    dev.extVoltage != null ? dev.extVoltage / 10 : null,
     odometer:   dev.odometer ?? dev.mileage ?? null,
+
+    // Ignition / ACC
     ignition:   dev.acc != null ? Boolean(Number(dev.acc)) : null,
+
+    // Address if Wanway provided it
     address:    dev.address ?? dev.location ?? null,
-    // WanWay timestamps are Unix seconds → convert to ms
+
+    // Timestamps — data.processor.js handles staleness validation
     gpsTimestampMs:     dev.gpsTime    ? dev.gpsTime    * 1000 : null,
     signalTimestampMs:  dev.signalTime ? dev.signalTime * 1000 : null,
+
     source:             'wanway',
-    needsGcjConversion: true,
+    // ✅ FIX-1: Wanway sends WGS-84 already, NOT GCJ-02
+    needsGcjConversion: false,  // Changed from: true
   };
 }
 
@@ -416,7 +402,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     }
   }
 
-  // FIX-2 + FIX-3: Compute running daily totals BEFORE writing to DB
+  // Compute running daily totals BEFORE writing to DB
   let todayDistKm = 0;
   let engineHrs   = 0;
   if (hasValidGPS && !isDuplicate) {
@@ -456,7 +442,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     }
   }
 
-  // 7b. FIX-1: Store LocationPing (queried by TripPlaybackController)
+  // 7b. Store LocationPing (queried by TripPlaybackController)
   if (hasValidGPS && !isDuplicate) {
     try {
       await LocationPing.create({
@@ -475,8 +461,8 @@ async function processIncomingData(rawDevice, source = 'wanway') {
         deviceTime:       now,
         address:          null,           // filled in after geocode below
         serverOdometerKm: dev.odometer ?? 0,
-        todayDistance:    todayDistKm,    // FIX-2: running daily km
-        engineHours:      engineHrs,      // FIX-3: running engine-on hours
+        todayDistance:    todayDistKm,
+        engineHours:      engineHrs,
         source:           dev.source,
       });
     } catch (err) {
@@ -512,12 +498,8 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     isOnline, isLive: isOnline,
     lastUpdate: now,
     status,
-    // FIX-2/FIX-3: keep live running counters on Vehicle doc so
-    // getMileageReport fallback can read them without DailySummary
     todayDistance:    todayDistKm,
     todayEngineHours: engineHrs,
-    // todayMaxSpeed is handled via $max below — do NOT also put it in $set
-    // or MongoDB throws "conflict at todayMaxSpeed"
   };
 
   if (hasValidGPS) {
@@ -555,14 +537,13 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   try {
     await Vehicle.findByIdAndUpdate(vehicleId, {
       $set: vehicleUpdate,
-      // Use $max so todayMaxSpeed only ever increases during the day
       $max: { todayMaxSpeed: dev.speed },
     });
   } catch (err) {
     logger.error('❌ [Processor] Vehicle update failed for IMEI=%s: %s', dev.imei, err.message);
   }
 
-  // 10. Socket.IO emit
+  // ✅ FIX-2: 10. Socket.IO emit — NOW WITH IGNITION FIELD
   if (global.io && hasValidGPS) {
     global.io.emit('vehicleMovement', {
       id:               vehicleId.toString(),
@@ -574,16 +555,19 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       heading:          dev.heading,
       isOnline,         isLive: isOnline,
       status,
-      satellites:       dev.satellites,
-      accuracy:         dev.accuracy,
-      // FIX-5: all voltage aliases so Flutter _firstDouble always finds one
-      voltage:          dev.voltage,
-      external_voltage: dev.voltage,
-      bat_v:            dev.voltage,
-      // FIX-3/FIX-A: all ignition aliases
+      // ✅ FIX-2: ALL ignition aliases now included
       ignition:         dev.ignition,
       ignitionOn:       dev.ignition === true,
       acc:              dev.ignition,
+      engineOn:         dev.ignition === true,
+      engine:           dev.ignition,
+      power:            dev.ignition,
+      // End ignition aliases
+      satellites:       dev.satellites,
+      accuracy:         dev.accuracy,
+      voltage:          dev.voltage,
+      external_voltage: dev.voltage,
+      bat_v:            dev.voltage,
       address,
       location:          address,
       formattedLocation: address,
@@ -592,8 +576,6 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       deviceTime:        now.toISOString(),
       lastUpdate:        now.toISOString(),
       source:            dev.source,
-      // Running daily totals — Flutter reads these from the socket event
-      // so it doesn't need to wait for the next HTTP mileage poll
       todayDistance:    todayDistKm,
       todayKm:          todayDistKm,
       engineHours:      engineHrs,
@@ -612,7 +594,6 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   });
 
   // FIX-8: Winston only supports %s/%d/%i/%o — not printf-style %.Nf.
-  // Pre-format floats with .toFixed() and pass them as %s strings.
   logger.info(
     '✅ [Processor] IMEI=%s | src=%s | lat=%s lng=%s | spd=%s | ign=%s | dup=%s | todayKm=%s | engH=%s',
     dev.imei,
