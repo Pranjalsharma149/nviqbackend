@@ -69,13 +69,11 @@ const REGISTERED_DEVICES = [
 
   // ── MultiTrackVTS Platform Devices (AIS 140 VLTD) ──────────────────────────
   {
-    // ⚠️  NOTE: MultiTrackVTS identifies vehicles by chassis number (vehicleNumber),
-    //     NOT by IMEI. We store the chassis number in the `imei` field so it flows
-    //     through data.processor.js without any schema changes.
-    //     Actual IMEI: 860187062376870 (3GBT-140 device IMEI from fitment cert)
-    imei:         'MA3SFM61STA461818',  // ← Chassis No. as stored on MultiTrackVTS platform
-    // Note: Fitment cert shows MA3BNC62SRC767065 but MultiTrackVTS uses MA3SFM61STA461818
-    vehicleReg:   'GJ15AX0695',        // ← RTO registration number
+    // ✅ CORRECT: Using the ACTUAL vehicleNumber from MultiTrackVTS dashboard
+    // Dashboard shows: K15CN9457322 (this is YOUR vehicle in Vapi)
+    // Wrong API was returning: MA3SFM61STA461818 (a different vehicle in Gandhinagar)
+    imei:         'K15CN9457322',       // ✅ Engine No. = Correct vehicleNumber in MultiTrack API
+    vehicleReg:   'GJ15AX0695',         // ← Vehicle Registration Number
     name:         'HANSABEN C PATEL - Tour M CNG',
     type:         'car',
     protocol:     'MULTITRACK',         // Via MultiTrackVTS platform
@@ -85,14 +83,15 @@ const REGISTERED_DEVICES = [
     fuelAlert:    15,
     battAlert:    20,
 
-    // AIS 140 specific metadata (for reference / future use)
-    deviceMake:   '3GB TECHNOLOGY PVT LTD',
-    deviceModel:  '3GBT-140',
-    deviceImei:   '860187062376870',
-    deviceSerial: '3GBT01A022600013674',
-    simIccid:     '8991102305852005166',
-    fitmentDate:  '2026-05-02',
-    rtoCodes:     'GJ15',
+    // AIS 140 / VLTD Device Information (from fitment certificate & MultiTrack dashboard)
+    maker:        'MARUTI SUZUKI INDIA LTD',
+    model:        'TOUR M (O) CNG',
+    chassisNo:    'MA3BNC62SRC767065',  // Chassis number from RTO certificate
+    deviceImei:   '860187062376870',    // GPS Device IMEI
+    engineNo:     'K15CN9457322',       // Engine number = vehicleNumber in MultiTrack
+    fitmentDate:  '2024-03-29',         // Manufacturing date
+    rtoCodes:     'GJ15',               // Vapi RTO code
+    manufacturingYear: 2024,
   },
 
 ];
@@ -128,7 +127,7 @@ module.exports = {
   getMultitrackDevices: () => REGISTERED_DEVICES
     .filter(d => d.protocol === 'MULTITRACK'),
 
-  // Returns chassis numbers used as IDs by MultiTrackVTS
+  // Returns vehicle numbers used as IDs by MultiTrackVTS
   getMultitrackIMEIs: () => REGISTERED_DEVICES
     .filter(d => d.protocol === 'MULTITRACK')
     .map(d => d.imei),
@@ -143,10 +142,14 @@ module.exports = {
  * Device 2 — PT06 lite   | IMEI: 868720064616620    | Via WanWay IOP GPS
  * Device 3 — PRIME09     | IMEI: 866221070653410    | Direct TCP port 5001
  * Device 4 — VL149       | IMEI: 867010072155188    | Direct TCP port 5001
- * Device 5 — 3GBT-140    | IMEI: 860187062376870    | Via MultiTrackVTS (AIS 140)
- *             Chassis:     MA3SFM61STA461818  (as stored on MultiTrackVTS)
- *             Reg:         GJ15AX0695
- *             Owner:       HANSABEN C PATEL
+ * Device 5 — 3GBT-140    | Engine No: K15CN9457322  | Via MultiTrackVTS (AIS 140)
+ *             Registration:  GJ15AX0695
+ *             Chassis:       MA3BNC62SRC767065
+ *             Owner:         HANSABEN C PATEL
+ *             Location:      Vapi, Valsad, Gujarat (CORRECT!)
+ *
+ * ✅ FIXED: Using K15CN9457322 (actual vehicle in Vapi)
+ * ❌ IGNORED: MA3SFM61STA461818 (different vehicle in Gandhinagar)
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * CONFIGURING DIRECT TCP DEVICES (PRIME09 & VL149)

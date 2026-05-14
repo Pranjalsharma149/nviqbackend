@@ -5,7 +5,7 @@ const mongoose = require('mongoose');
 /**
  * RawGpsLog — PRIMARY SOURCE OF TRUTH
  *
- * Every GPS point from TCP + WanWay is written here unconditionally.
+ * Every GPS point from TCP + WanWay + MultiTrack is written here unconditionally.
  * NEVER filter by speed. NEVER skip idle. NEVER overwrite.
  * Analytics are always derived from this collection.
  */
@@ -64,7 +64,7 @@ const RawGpsLogSchema = new mongoose.Schema(
     // ── Source ────────────────────────────────────────────────────────────────
     source: {
       type:     String,
-      enum:     ['tcp', 'wanway'],
+      enum:     ['tcp', 'wanway', 'multitrack'],  // ← UPDATED: added 'multitrack'
       required: true,
     },
 

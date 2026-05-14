@@ -130,7 +130,7 @@ function _gcj02ToWgs84(gcjLng, gcjLat) {
  * into the shape expected by RawGpsLog.create / insertMany.
  *
  * @param {Object}  dev          Normalised device object from poller
- * @param {string}  source       'wanway' | 'tcp'
+ * @param {string}  source       'wanway' | 'tcp' | 'multitrack'
  * @param {Map}     vehicleMap   imei → ObjectId
  * @returns {{ doc: Object|null, imei: string }}
  */
@@ -155,7 +155,7 @@ function _buildDocument(dev, source, vehicleMap) {
 
   if (lat === 0 && lng === 0) return { doc: null, imei };   // Null-island
 
-  // WanWay: GCJ-02 → WGS-84. TCP: already WGS-84.
+  // WanWay: GCJ-02 → WGS-84. TCP/MultiTrack: already WGS-84.
   if (source === 'wanway') {
     const wgs = _gcj02ToWgs84(lng, lat);
     lat = wgs.lat;
@@ -212,7 +212,7 @@ function _buildDocument(dev, source, vehicleMap) {
  * - Returns a stats object for observability.
  *
  * @param {Array}  devices  Normalised records from wanway.poller.normalizeDevices()
- * @param {string} source   'wanway' | 'tcp'
+ * @param {string} source   'wanway' | 'tcp' | 'multitrack'
  * @returns {Promise<{ inserted: number, duplicates: number, skipped: number }>}
  */
 async function saveRawBatch(devices, source = 'wanway') {
@@ -280,7 +280,7 @@ async function saveRawBatch(devices, source = 'wanway') {
 // ── saveRawSingle — convenience wrapper for TCP (single device at a time) ─────
 /**
  * @param {Object} device  Single normalised device record
- * @param {string} source  'tcp' | 'wanway'
+ * @param {string} source  'tcp' | 'wanway' | 'multitrack'
  */
 async function saveRawSingle(device, source = 'tcp') {
   return saveRawBatch([device], source);

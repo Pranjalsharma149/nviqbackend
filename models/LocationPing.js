@@ -35,7 +35,11 @@ const locationPingSchema = new mongoose.Schema({
   todayDistance:    { type: Number, default: 0 },      // distance today in km
   engineHours:      { type: Number, default: 0 },      // engine-on hours today
 
-  source:           { type: String, default: 'wanway' },
+  source:           {
+    type:    String,
+    enum:    ['wanway', 'tcp', 'multitrack'],  // ← UPDATED: added 'multitrack'
+    default: 'wanway'
+  },
 }, {
   timestamps: true,
   versionKey: false,

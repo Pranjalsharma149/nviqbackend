@@ -1,11 +1,26 @@
 'use strict';
 
 /**
- * WANWAY IOP GPS POLLER SERVICE
- * 
- * Fetches device positions from Wanway/IOPGPS API every 30 seconds.
- * All data is forwarded to processBulkUpdates() in data.processor.js
- * so ALL validation, conversion, and DB writes happen in ONE place.
+ * WANWAY IOP GPS POLLER SERVICE — v2.1
+ *
+ * FIXES vs v2.0:
+ *   FIX-IGN-1: normalizeDevices() now extracts ignition from ALL known
+ *              IOPGPS field names. The /api/device/status response uses
+ *              'accStatus' (integer 0/1), not 'acc' or 'ignition'.
+ *              Previous code: acc: d.acc ?? d.ignition ?? null → always null
+ *              Fixed: checks accStatus, acc, ignition, io, io1, din1, etc.
+ *
+ *   FIX-IGN-2: gpsTime field from IOPGPS is Unix epoch in SECONDS.
+ *              'locTime' is the alternative field name in some API versions.
+ *              Both are now handled.
+ *
+ *   FIX-ODO:   odometer from IOPGPS is in km (not metres). No conversion needed.
+ *              Field names checked: mileage, totalMileage, odometer, odo.
+ *
+ *   FIX-SAT:   Satellite count field in IOPGPS is 'satellites' or 'gpsNum'.
+ *
+ *   FIX-VOLT:  External voltage from IOPGPS is in tenths of a volt (e.g. 125 = 12.5V).
+ *              extVoltage is divided by 10. If field is 'voltage' it's already in V.
  */
 
 const axios  = require('axios');
@@ -73,10 +88,7 @@ async function getAccessToken() {
 
     accessToken = response.data.accessToken;
 
-    // FIX: Wanway sends expiresIn in SECONDS not milliseconds.
-    // Original code: Date.now() + (expiresIn || 7200000)
-    // If expiresIn=7200 (seconds), that's only 7.2 seconds from now — always expired.
-    // Fix: multiply by 1000 to convert seconds → ms, subtract 5min buffer.
+    // expiresIn is in SECONDS — multiply by 1000 for ms, subtract 5min buffer
     const expiresInMs = (response.data.expiresIn || 7200) * 1000;
     tokenExpiry = Date.now() + expiresInMs - (5 * 60 * 1000);
 
@@ -96,9 +108,7 @@ async function getAccessToken() {
   }
 }
 
-// ── Fetch Device Data from Wanway API ─────────────────────────────────────────
-// Returns raw API response array — NO processing done here.
-// All normalization happens in data.processor.js
+// ── Fetch Device Data from Wanway/IOPGPS API ──────────────────────────────────
 async function fetchDeviceData() {
   try {
     const token    = await getAccessToken();
@@ -111,7 +121,7 @@ async function fetchDeviceData() {
 
     logger.info('📡 Fetching IOP GPS data for %d devices...', imeiList.length);
 
-    // Strategy 1: Device status endpoint
+    // Strategy 1: Device status endpoint (returns accStatus field for ignition)
     try {
       const response = await axios.get(
         `${CONFIG.baseUrl}/api/device/status`,
@@ -127,6 +137,20 @@ async function fetchDeviceData() {
         Array.isArray(response.data.data) &&
         response.data.data.length > 0
       ) {
+        // Log the RAW first device so we can see all field names
+        if (response.data.data.length > 0) {
+          logger.info(
+            '🔍 [IOPGPS] RAW device fields: %s',
+            Object.keys(response.data.data[0]).join(', ')
+          );
+          logger.info(
+            '🔍 [IOPGPS] RAW ignition-related: accStatus=%s acc=%s ignition=%s io=%s',
+            response.data.data[0].accStatus,
+            response.data.data[0].acc,
+            response.data.data[0].ignition,
+            response.data.data[0].io
+          );
+        }
         logger.info('✅ Strategy 1 success: %d devices', response.data.data.length);
         consecutiveErrors = 0;
         return response.data.data;
@@ -202,40 +226,116 @@ async function fetchDeviceData() {
   }
 }
 
-// ── Normalize raw Wanway API response into processBulkUpdates format ──────────
-// This is the ONLY transformation done in the poller.
-// Field mapping: Wanway API field names → data.processor.js expected names.
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX-IGN-1: Parse ignition from ALL known IOPGPS field names
+//
+// IOPGPS /api/device/status returns ignition as:
+//   accStatus  — integer: 1=ON, 0=OFF  ← PRIMARY field for IOPGPS
+//   acc        — integer or boolean
+//   ignition   — boolean (some API versions)
+//   io         — bitmask (bit 0 = ACC/ignition)
+//   io1        — direct ACC input
+//   din1       — digital input 1 (ACC on Wanway GT06 protocol)
+//
+// Returns: true | false | null
+//   null = field not present (treat as unknown, use speed-based inference)
+// ─────────────────────────────────────────────────────────────────────────────
+function parseIgnition(d) {
+  // Priority 1: accStatus (primary IOPGPS field)
+  if (d.accStatus !== undefined && d.accStatus !== null) {
+    return Number(d.accStatus) === 1;
+  }
+
+  // Priority 2: acc (Wanway protocol field)
+  if (d.acc !== undefined && d.acc !== null) {
+    if (typeof d.acc === 'boolean') return d.acc;
+    if (typeof d.acc === 'number')  return d.acc === 1;
+    if (typeof d.acc === 'string')  return d.acc === '1' || d.acc.toLowerCase() === 'on';
+  }
+
+  // Priority 3: ignition
+  if (d.ignition !== undefined && d.ignition !== null) {
+    if (typeof d.ignition === 'boolean') return d.ignition;
+    if (typeof d.ignition === 'number')  return d.ignition === 1;
+    if (typeof d.ignition === 'string')  return d.ignition === '1' || d.ignition.toLowerCase() === 'on';
+  }
+
+  // Priority 4: io bitmask (bit 0 = ACC)
+  if (d.io !== undefined && d.io !== null) {
+    return (Number(d.io) & 1) === 1;
+  }
+
+  // Priority 5: io1 or din1 (direct digital input)
+  const din = d.io1 ?? d.din1 ?? d.DIN1 ?? d.IO1;
+  if (din !== undefined && din !== null) {
+    return Number(din) === 1;
+  }
+
+  // Priority 6: engineStatus / engine
+  if (d.engineStatus !== undefined && d.engineStatus !== null) {
+    return Number(d.engineStatus) === 1;
+  }
+
+  // Not found — return null so processor can infer from speed
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// normalizeDevices — map IOPGPS raw API fields to data.processor.js schema
+//
+// This is the ONLY place raw IOPGPS field names are translated.
+// data.processor.js receives the normalized format and never sees raw fields.
+// ─────────────────────────────────────────────────────────────────────────────
 function normalizeDevices(rawDevices) {
-  return rawDevices.map(d => ({
-    // Identity
-    imei: String(d.imei || d.imeino || d.deviceId || ''),
+  return rawDevices.map(d => {
+    const ignition = parseIgnition(d);
 
-    // Coordinates — raw GCJ-02, conversion done in data.processor.js
-    lat: d.lat  ?? d.latitude  ?? null,
-    lng: d.lng  ?? d.longitude ?? null,
+    // Voltage: extVoltage is in tenths of a volt (125 → 12.5V)
+    //          voltage field (if present) is already in volts
+    let voltage = null;
+    if (d.extVoltage != null) {
+      voltage = d.extVoltage > 100 ? d.extVoltage / 10 : d.extVoltage;
+    } else if (d.voltage != null) {
+      voltage = Number(d.voltage);
+    } else if (d.power != null) {
+      voltage = d.power > 100 ? d.power / 10 : Number(d.power);
+    }
 
-    // Motion
-    speed:   parseFloat(d.speed   ?? 0),
-    course:  parseFloat(d.course  ?? d.heading ?? 0),
+    // Odometer: IOPGPS sends in km already (mileage field)
+    const odometer = d.mileage ?? d.totalMileage ?? d.odometer ?? d.odo ?? null;
 
-    // Timestamps — data.processor.js handles staleness validation
-    // gpsTime from Wanway is Unix epoch in SECONDS
-    gpsTime:    d.gpsTime    ?? d.locTime   ?? null,
-    signalTime: d.signalTime ?? d.loginTime ?? null,
+    return {
+      // Identity
+      imei: String(d.imei || d.imeino || d.deviceId || d.device_id || ''),
 
-    // Vehicle info
-    altitude:   d.altitude   ?? 0,
-    satellites: d.satellites ?? d.gpsNum ?? 0,
-    accuracy:   d.accuracy   ?? d.hdop   ?? 0,
-    extVoltage: d.extVoltage ?? d.voltage ?? null,
-    odometer:   d.odometer   ?? d.mileage ?? null,
+      // Coordinates — WGS-84 (IOPGPS converts GCJ-02 server-side)
+      lat: d.lat  ?? d.latitude  ?? null,
+      lng: d.lng  ?? d.longitude ?? null,
 
-    // Ignition / ACC
-    acc: d.acc ?? d.ignition ?? null,
+      // Motion
+      speed:  parseFloat(d.speed  ?? 0),
+      course: parseFloat(d.course ?? d.heading ?? d.direction ?? 0),
 
-    // Address if Wanway provided it
-    address: d.address ?? d.location ?? null,
-  }));
+      // Timestamps — Unix epoch in SECONDS from IOPGPS
+      gpsTime:    d.gpsTime    ?? d.locTime   ?? d.gps_time  ?? null,
+      signalTime: d.signalTime ?? d.loginTime ?? d.sign_time ?? null,
+
+      // GPS quality
+      altitude:   parseFloat(d.altitude   ?? 0),
+      satellites: parseInt(d.satellites   ?? d.gpsNum ?? d.satelliteNum ?? 0, 10),
+      accuracy:   parseFloat(d.accuracy   ?? d.hdop   ?? 0),
+
+      // Electrical
+      extVoltage: voltage,
+      odometer:   odometer != null ? parseFloat(odometer) : null,
+
+      // FIX-IGN-1: Ignition — now properly parsed from accStatus/acc/io/etc.
+      acc: ignition,
+
+      // Address if IOPGPS provided it
+      address: d.address ?? d.location ?? d.positionDesc ?? null,
+    };
+  });
 }
 
 // ── Single poll cycle ─────────────────────────────────────────────────────────
@@ -244,10 +344,22 @@ async function doPoll() {
     const rawDevices = await fetchDeviceData();
     if (rawDevices.length === 0) return;
 
-    // Normalize field names then hand off to data.processor.js
-    // which handles: GCJ02→WGS84, GPS age check, spike detection,
-    // DB write, socket emit, location ping, trip detection.
     const normalized = normalizeDevices(rawDevices);
+
+    // Log ignition state after normalization for debugging
+    for (const dev of normalized) {
+      logger.info(
+        '🔌 [IOPGPS Normalized] IMEI=%s lat=%s lng=%s spd=%s ign=%s volt=%s sats=%s',
+        dev.imei,
+        dev.lat,
+        dev.lng,
+        dev.speed,
+        dev.acc,         // null means unknown
+        dev.extVoltage,
+        dev.satellites
+      );
+    }
+
     await processBulkUpdates(normalized);
 
   } catch (err) {
@@ -273,10 +385,7 @@ async function startPolling() {
     CONFIG.pollInterval
   );
 
-  // Run immediately on start
   await doPoll();
-
-  // Then on interval
   pollingInterval = setInterval(doPoll, CONFIG.pollInterval);
 }
 

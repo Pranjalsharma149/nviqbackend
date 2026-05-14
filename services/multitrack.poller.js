@@ -1,11 +1,13 @@
 'use strict';
 
 /**
- * MULTITRACK VTS POLLER SERVICE
+ * MULTITRACK VTS POLLER SERVICE (UPDATED)
  *
  * Fetches live vehicle positions from MultiTrackVTS API every 60 seconds.
  * Normalizes data into the SAME format as wanway.poller.js and forwards
- * to processBulkUpdates() in data.processor.js.
+ * to both:
+ *   1. saveRawBatch() in rawGps.service.js  → RawGpsLog (audit trail)
+ *   2. processBulkUpdates() in data.processor.js → vehicle updates + socket emit
  *
  * ⚠️  wanway.poller.js is NOT touched. Both run in parallel.
  * ⚠️  Minimum poll interval is 60s (MultiTrackVTS platform enforces this).
@@ -20,6 +22,7 @@ const axios  = require('axios');
 const https  = require('https');
 const logger = require('../utils/logger');
 const { processBulkUpdates }   = require('./data.processor');
+const { saveRawBatch }         = require('./rawGps.service');  // ← NEW
 const { getMultitrackDevices } = require('../config/devices');
 
 // ── Configuration ─────────────────────────────────────────────────────────────
@@ -84,6 +87,18 @@ async function fetchPositions() {
     }
 
     logger.info('✅ [MultiTrack] Received %d vehicle(s) from platform', response.data.length);
+    
+    // 🔍 DEBUG: Log raw API response for each vehicle
+    response.data.forEach(vehicle => {
+      logger.info('🔍 [MultiTrack] RAW API RESPONSE: vehicleNumber=%s | lat=%s | long=%s | power=%s | ignition=%s',
+        vehicle.vehicleNumber,
+        vehicle.lat,
+        vehicle.long,
+        vehicle.power,
+        vehicle.ignition
+      );
+    });
+    
     consecutiveErrors = 0;
     return response.data;
 
@@ -140,10 +155,10 @@ function filterKnownVehicles(rawDevices) {
   return known;
 }
 
-// ── Normalize MultiTrackVTS response → processBulkUpdates format ──────────────
+// ── Normalize MultiTrackVTS response → common schema ───────────────────────────
 //
-// MultiTrackVTS field   →   data.processor.js expected field
-// ─────────────────────────────────────────────────────────────
+// MultiTrackVTS field   →   processor.js expected field
+// ─────────────────────────────────────────────────────────
 // vehicleNumber         →   imei       (chassis no. = unique device ID)
 // lat                   →   lat
 // long                  →   lng
@@ -214,12 +229,18 @@ async function doPoll() {
       return;
     }
 
-    // 3. Normalize to data.processor.js format
+    // 3. Normalize to common schema
     const normalized = normalizeDevices(knownDevices);
 
-    // 4. Hand off to the SAME processor as Wanway
+    // 4. NEW: Persist raw GPS logs (non-blocking, doesn't block real-time updates)
+    // This creates an audit trail and enables trip playback
+    saveRawBatch(normalized, 'multitrack').catch(err => {
+      logger.error('❌ [MultiTrack] Raw GPS batch save failed: %s', err.message);
+    });
+
+    // 5. Hand off to the processor for real-time updates
     //    → DB write, Socket.IO emit, trip detection, alerts all happen here
-    await processBulkUpdates(normalized);
+    await processBulkUpdates(normalized, 'multitrack');
 
   } catch (err) {
     logger.error('❌ [MultiTrack] Poll cycle error: %s', err.message);
