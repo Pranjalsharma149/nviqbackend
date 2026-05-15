@@ -31,6 +31,7 @@ async function _ensureReferralCode(user) {
 }
 
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
+// Email/Password login (alternative method)
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -61,6 +62,8 @@ router.post('/login', async (req, res) => {
 });
 
 // ── POST /api/auth/phone-login ────────────────────────────────────────────────
+// Primary method: Firebase Phone OTP verification
+// Called by login_screen.dart after Firebase verifies the OTP
 router.post('/phone-login', async (req, res) => {
   try {
     const { phone, name, firebaseUid } = req.body;
@@ -72,6 +75,7 @@ router.post('/phone-login', async (req, res) => {
       $or: [{ phone }, { phone: digits }, { email: `${digits}@nviq.app` }],
     });
 
+    // Auto-create user on first phone login
     if (!user) {
       user = await User.create({
         name:     name || `Fleet-Manager-${digits.slice(-4)}`,
@@ -101,8 +105,8 @@ router.post('/phone-login', async (req, res) => {
 });
 
 // ── POST /api/auth/verify-otp ─────────────────────────────────────────────────
-// Called by the mobile app after Firebase Phone Auth verifies the OTP.
-// Expects: { phone, firebaseUid, name? }
+// Alternative method (legacy support)
+// Called by mobile app after Firebase Phone Auth verifies the OTP
 router.post('/verify-otp', async (req, res) => {
   try {
     const { phone, firebaseUid, name } = req.body;
@@ -153,8 +157,25 @@ router.post('/verify-otp', async (req, res) => {
 });
 
 // ── GET /api/auth/me ──────────────────────────────────────────────────────────
+// Get authenticated user's profile
 router.get('/me', protect, async (req, res) => {
   res.json({ success: true, data: _userPayload(req.user) });
+});
+
+// ── GET /api/auth/validate ────────────────────────────────────────────────────
+// ✅ NEW ROUTE - Called by login_screen.dart on app startup
+// Validates if stored JWT token is still valid
+// Returns 200 if valid, 401 if invalid/expired
+router.get('/validate', protect, async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      valid: true,
+      data: _userPayload(req.user),
+    });
+  } catch (e) {
+    res.status(401).json({ success: false, message: 'Invalid token' });
+  }
 });
 
 module.exports = router;
