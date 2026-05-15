@@ -5,39 +5,61 @@
  *
  * REST API controller for all vehicle-related endpoints.
  *
- * FIXES applied to align with Flutter live_tracking_screen.dart:
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SECURITY FIXES (this version):
+ *
+ *   FIX-SCOPE-1  getAllVehicles() and getLiveVehicles() previously called
+ *                Vehicle.find({}) with NO filter — every user saw every vehicle
+ *                in the database. Now filters by req.user.phone so each user
+ *                only receives their own vehicles.
+ *
+ *   FIX-SCOPE-2  createVehicle() previously trusted the phone/userId from the
+ *                request body — a client could claim any phone. Now phone and
+ *                userId are always taken from req.user (set by protect middleware)
+ *                and the 16-vehicle limit is enforced here too.
+ *
+ *   FIX-SCOPE-3  getVehicleById() previously had no ownership check — any
+ *                authenticated user could fetch any vehicle by ID. Now verifies
+ *                vehicle.phone === req.user.phone before responding.
+ *
+ *   FIX-SCOPE-4  getVehicleAlerts() previously returned alerts for any vehicleId
+ *                without checking ownership. Now verifies ownership first.
+ *
+ *   FIX-SCOPE-5  updateVehicle() and deleteVehicle() previously had no ownership
+ *                check. Now verifies vehicle.phone === req.user.phone.
+ *
+ *   FIX-SCOPE-6  sendCommand() now verifies vehicle ownership before emitting
+ *                socket command.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * PREVIOUSLY APPLIED FIXES (unchanged):
  *
  *   FIX-1  getMileageReport: returns todayDistanceKm, dailyDistance, distanceToday
- *          as SEPARATE fields from totalDistanceKm (odometer). Was reading same
- *          field for both, causing Flutter to show wrong "Today Dist" value.
+ *          as SEPARATE fields from totalDistanceKm (odometer).
  *
  *   FIX-2  getMileageReport: returns engineHours, totalEngineHours, runningHours
  *          so Flutter _fetchWanwayDataForVehicle() finds the field regardless of
  *          which alias it tries first.
  *
  *   FIX-3  normalise(): emits ignitionOn AND ignition so Flutter's _parseBoolField
- *          catches it on both 'ignitionOn' and 'ignition' keys.
+ *          catches it on both keys.
  *
- *   FIX-4  getMileageReport: totalDistanceKm / odometer / odometerKm are now taken
- *          from the ODOMETER field, never conflated with today's distance.
+ *   FIX-4  getMileageReport: totalDistanceKm / odometer / odometerKm taken from
+ *          the ODOMETER field, never conflated with today's distance.
  *
- *   FIX-5  normalise(): batteryVoltage AND voltage both emitted so Flutter's
- *          _firstDouble finds it regardless of which alias it uses.
+ *   FIX-5  normalise(): batteryVoltage AND voltage both emitted.
  *
- *   FIX-6  getDeviceInfo: returns activationTime, registrationTime, installDate,
- *          createdAt, firstSeen, addTime so Flutter _fetchInstallDate() finds one.
+ *   FIX-6  getDeviceInfo: returns all install-date aliases Flutter probes.
  *
- *   FIX-7  normalise(): vehicleTypeKey added (Flutter uses vehicleTypeKey, not type).
+ *   FIX-7  normalise(): vehicleTypeKey added.
  *
- *   FIX-8  normalise(): todayDistanceKm, totalDistanceKm, engineHoursToday all
- *          exposed at top level so Flutter _VState seeding reads them immediately.
+ *   FIX-8  normalise(): todayDistanceKm, totalDistanceKm, engineHoursToday
+ *          exposed at top level.
  *
- *   FIX-9  getMileageReport: falls back to computing from RawGpsLog when
- *          DailySummary is missing AND analytics.service is unavailable —
- *          returns zero-valued object instead of throwing.
+ *   FIX-9  getMileageReport: falls back gracefully when DailySummary and
+ *          analytics.service are both unavailable.
  *
- *   FIX-10 normalise(): lastGpsTime added as alias for lastUpdate so Flutter
- *          _loadLastFixTimes() can read it from the summaries map.
+ *   FIX-10 normalise(): lastGpsTime added as alias for lastUpdate.
  */
 
 const mongoose     = require('mongoose');
@@ -47,19 +69,32 @@ const RawGpsLog    = require('../models/RawGpsLog');
 const Alert        = require('../models/Alert');
 const logger       = require('../utils/logger');
 
-// ── Field selector ────────────────────────────────────────────────────────────
+// ── Field selector ─────────────────────────────────────────────────────────────
 const VEHICLE_FIELDS = [
-  'name', 'vehicleReg', 'imei', 'type', 'protocol',
-  'status', 'isOnline', 'isLive',
+  'name', 'vehicleReg', 'registrationNumber', 'imei', 'type', 'protocol',
+  'status', 'deviceStatus', 'isOnline', 'isLive', 'gpsSignal',
   'latitude', 'longitude', 'speed', 'heading',
   'ignition', 'voltage', 'satellites', 'accuracy', 'odometer',
-  'address', 'lastUpdate', 'lastKnownLocation',
+  'address', 'location', 'lastUpdate', 'lastKnownLocation',
   'todayDistance', 'todayEngineHours', 'todayMaxSpeed',
   'pocName', 'pocContact', 'speedLimit',
-  'analytics', 'userId',
+  'analytics', 'userId', 'phone',
+  'createdAt', 'updatedAt',
 ].join(' ');
 
-// ── Normalise → Flutter VehicleModel fields ───────────────────────────────────
+// ── Ownership helper ───────────────────────────────────────────────────────────
+/**
+ * Returns the vehicle if it exists AND belongs to the requesting user.
+ * Returns null if not found, throws nothing — callers handle the response.
+ */
+async function findOwnedVehicle(vehicleId, userPhone, fields = 'phone') {
+  const vehicle = await Vehicle.findById(vehicleId).select(fields).lean();
+  if (!vehicle) return { vehicle: null, reason: 'not_found' };
+  if (vehicle.phone !== userPhone) return { vehicle: null, reason: 'forbidden' };
+  return { vehicle, reason: null };
+}
+
+// ── Normalise → Flutter VehicleModel fields ────────────────────────────────────
 /**
  * Maps a Mongoose Vehicle document into the exact shape Flutter's
  * VehicleModel.fromJson() and live_tracking_screen.dart expect.
@@ -71,44 +106,46 @@ function normalise(v) {
   const lat = v.latitude  ?? null;
   const lng = v.longitude ?? null;
 
-  // ── Address resolution (multiple fallbacks match Flutter's _getDisplayAddress) ──
+  // ── Address resolution ───────────────────────────────────────────────────────
   const address =
-    v.address                      ||
-    v.lastKnownLocation?.address   ||
+    v.address                    ||
+    v.lastKnownLocation?.address ||
     (lat && lng && !(lat === 0 && lng === 0)
       ? `${Number(lat).toFixed(5)}, ${Number(lng).toFixed(5)}`
       : 'Unknown location');
 
-  // ── FIX-3: Ignition — emit both key names Flutter probes ─────────────────
+  // ── FIX-3: Ignition — both key names Flutter probes ─────────────────────────
   const ignitionBool = v.ignition ?? false;
 
-  // ── FIX-5: Voltage — Flutter probes 'batteryVoltage' and 'voltage' ────────
+  // ── FIX-5: Voltage — Flutter probes 'batteryVoltage' and 'voltage' ──────────
   const voltageVal = v.voltage ?? 0;
 
-  // ── FIX-8: Today/total distance & engine hours ────────────────────────────
-  // todayDistance is the running daily accumulator written by data.processor.js
-  // odometer       is the cumulative total written by data.processor.js / device
+  // ── FIX-8: Today / total distance & engine hours ─────────────────────────────
   const todayKm   = v.todayDistance    ?? 0;
   const totalKm   = v.odometer         ?? 0;
   const engineHrs = v.todayEngineHours ?? 0;
 
+  // vehicleReg — schema uses registrationNumber, some docs use vehicleReg
+  const reg = v.vehicleReg ?? v.registrationNumber ?? '';
+
   return {
-    // ── Identity ────────────────────────────────────────────────────────────
+    // ── Identity ─────────────────────────────────────────────────────────────
     id:             (v._id ?? v.id)?.toString(),
-    name:           v.name       ?? v.vehicleReg ?? v.imei,
-    vehicleReg:     v.vehicleReg ?? '',
+    name:           v.name       ?? reg ?? v.imei ?? 'Vehicle',
+    vehicleReg:     reg,
     imei:           v.imei       ?? '',
 
-    // ── FIX-7: vehicleTypeKey — Flutter uses this, not 'type' ───────────────
+    // ── FIX-7: vehicleTypeKey — Flutter uses this, not just 'type' ───────────
     type:           v.type ?? 'car',
     vehicleTypeKey: v.type ?? 'car',
 
-    protocol:  v.protocol ?? 'WanWay',
+    protocol:  v.protocol ?? 'GT06',
     status:    v.status   ?? 'offline',
     isOnline:  v.isOnline ?? false,
     isLive:    v.isLive   ?? false,
+    gpsSignal: v.gpsSignal ?? true,
 
-    // ── Coordinates — Flutter reads lat/lng AND latitude/longitude ────────
+    // ── Coordinates — Flutter reads lat/lng AND latitude/longitude ───────────
     lat,
     lng,
     latitude:  lat,
@@ -148,9 +185,7 @@ function normalise(v) {
     lastUpdate:  v.lastUpdate ?? new Date(),
     lastGpsTime: v.lastUpdate ?? new Date(),
 
-    // ── FIX-1 / FIX-4 / FIX-8: Distance & engine hours at top level ─────────
-    // Flutter's _seedStates() and _hydrateColdStartData() read these directly
-    // from the vehicle model before the mileage report arrives.
+    // ── FIX-1 / FIX-4 / FIX-8: Distance & engine hours at top level ──────────
     todayDistanceKm:  todayKm,
     totalDistanceKm:  totalKm,
     engineHoursToday: engineHrs,
@@ -162,20 +197,37 @@ function normalise(v) {
 
     analytics: v.analytics ?? {},
     userId:    v.userId?.toString() ?? null,
+
+    // ownerId — Flutter fleet_provider.dart FIX-22 reads this field to filter
+    // socket broadcasts. We expose the phone as ownerId so the Flutter-side
+    // guard  (ownerId !== _currentNviqId) works correctly.
+    ownerId: v.phone ?? null,
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/vehicles
+//
+// FIX-SCOPE-1: Was Vehicle.find({}) — returned ALL vehicles to every user.
+// Now filters by req.user.phone so each user only sees their own fleet.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getAllVehicles = async (req, res) => {
   try {
-    const vehicles = await Vehicle.find({})
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+
+    const vehicles = await Vehicle.find({ phone })
       .select(VEHICLE_FIELDS)
-      .limit(1000)
+      .sort({ createdAt: -1 })
       .lean();
 
-    res.json({ success: true, count: vehicles.length, data: vehicles.map(normalise) });
+    res.json({
+      success: true,
+      count:   vehicles.length,
+      data:    vehicles.map(normalise),
+    });
   } catch (err) {
     logger.error('getAllVehicles error: %s', err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -184,15 +236,27 @@ exports.getAllVehicles = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/vehicles/live
+//
+// FIX-SCOPE-1: Same fix as getAllVehicles — was returning every device in DB.
+// Flutter calls this endpoint on dashboard load via ApiService.fetchLiveVehicles().
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getLiveVehicles = async (req, res) => {
   try {
-    const vehicles = await Vehicle.find({})
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+
+    const vehicles = await Vehicle.find({ phone })
       .select(VEHICLE_FIELDS)
-      .limit(1000)
+      .sort({ lastUpdate: -1 })
       .lean();
 
-    res.json({ success: true, count: vehicles.length, data: vehicles.map(normalise) });
+    res.json({
+      success: true,
+      count:   vehicles.length,
+      data:    vehicles.map(normalise),
+    });
   } catch (err) {
     logger.error('getLiveVehicles error: %s', err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -201,15 +265,27 @@ exports.getLiveVehicles = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/vehicles/:id
+//
+// FIX-SCOPE-3: Was returning any vehicle by ID with no ownership check.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getVehicleById = async (req, res) => {
   try {
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+
     const vehicle = await Vehicle.findById(req.params.id)
       .select(VEHICLE_FIELDS)
       .lean();
 
     if (!vehicle) {
       return res.status(404).json({ success: false, message: 'Vehicle not found' });
+    }
+
+    // FIX-SCOPE-3: ownership check
+    if (vehicle.phone !== phone) {
+      return res.status(403).json({ success: false, message: 'Not authorized to access this vehicle' });
     }
 
     res.json({ success: true, data: normalise(vehicle) });
@@ -222,49 +298,56 @@ exports.getVehicleById = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/vehicles/:id/device-info
 //
-// Flutter calls fetchDeviceInfo(vehicleId).
-// FIX-6: Returns ALL install-date field aliases Flutter's _fetchInstallDate()
-//        probes in order:
-//        activationTime, registrationTime, installDate, install_date,
-//        deviceRegistered, firstSeen, created_at, createdAt,
-//        addTime, add_time, activateTime, activate_time
+// FIX-SCOPE-3: Added ownership check.
+// FIX-6: Returns ALL install-date aliases Flutter's _fetchInstallDate() probes.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getDeviceInfo = async (req, res) => {
   try {
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+
     const vehicle = await Vehicle.findById(req.params.id)
-      .select('imei vehicleReg name type protocol pocName pocContact createdAt lastUpdate lastKnownLocation')
+      .select('imei vehicleReg registrationNumber name type protocol pocName pocContact createdAt lastUpdate lastKnownLocation phone')
       .lean();
 
     if (!vehicle) {
       return res.status(404).json({ success: false, message: 'Vehicle not found' });
     }
 
+    // FIX-SCOPE-3: ownership check
+    if (vehicle.phone !== phone) {
+      return res.status(403).json({ success: false, message: 'Not authorized to access this vehicle' });
+    }
+
     const installDate = vehicle.createdAt ?? new Date();
+    const reg         = vehicle.vehicleReg ?? vehicle.registrationNumber ?? '';
 
     res.json({
       success: true,
       data: {
         imei:       vehicle.imei,
-        vehicleReg: vehicle.vehicleReg,
+        vehicleReg: reg,
         name:       vehicle.name,
         type:       vehicle.type,
         protocol:   vehicle.protocol,
         pocName:    vehicle.pocName,
         pocContact: vehicle.pocContact,
 
-        // FIX-6: Every alias Flutter probes — return the same value for all
-        activationTime:  installDate,
+        // FIX-6: every alias Flutter probes in _fetchInstallDate()
+        activationTime:   installDate,
         registrationTime: installDate,
-        installDate:     installDate,
-        install_date:    installDate,
+        installDate:      installDate,
+        install_date:     installDate,
         deviceRegistered: installDate,
-        firstSeen:       installDate,
-        created_at:      installDate,
-        createdAt:       installDate,
-        addTime:         installDate,
-        add_time:        installDate,
-        activateTime:    installDate,
-        activate_time:   installDate,
+        firstSeen:        installDate,
+        created_at:       installDate,
+        createdAt:        installDate,
+        addTime:          installDate,
+        add_time:         installDate,
+        activateTime:     installDate,
+        activate_time:    installDate,
 
         lastUpdate: vehicle.lastUpdate ?? new Date(),
       },
@@ -278,46 +361,37 @@ exports.getDeviceInfo = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/vehicles/:id/mileage?date=YYYY-MM-DD
 //
-// Flutter calls fetchMileageReport(vehicleId, date).
-// _fetchWanwayDataForVehicle() then probes:
-//   - report.todayDistanceKm  (FIX-1: today's driven distance)
-//   - report.dailyDistance    (alias)
-//   - report.distanceToday    (alias)
-//   - report.totalDistanceKm  (FIX-4: cumulative odometer — SEPARATE field)
-//   - report.odometer         (alias)
-//   - report.odometerKm       (alias)
-//   - report.engineHours      (FIX-2: ignition-on hours today)
-//   - report.totalEngineHours (alias)
-//   - report.runningHours     (alias)
-//
-// CRITICAL: todayDistanceKm ≠ totalDistanceKm.
-//           todayDistanceKm = distance driven today (resets at midnight)
-//           totalDistanceKm = cumulative odometer (never resets)
+// FIX-SCOPE-3: Added ownership check.
+// FIX-1/2/4/9: Today distance, engine hours, odometer all correctly separated.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getMileageReport = async (req, res) => {
   try {
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+
     const vehicle = await Vehicle.findById(req.params.id)
-      .select('imei odometer todayDistance todayEngineHours todayMaxSpeed')
+      .select('imei odometer todayDistance todayEngineHours todayMaxSpeed phone')
       .lean();
 
     if (!vehicle) {
       return res.status(404).json({ success: false, message: 'Vehicle not found' });
     }
 
-    // ── Date range ────────────────────────────────────────────────────────────
+    // FIX-SCOPE-3: ownership check
+    if (vehicle.phone !== phone) {
+      return res.status(403).json({ success: false, message: 'Not authorized to access this vehicle' });
+    }
+
+    // ── Date range ─────────────────────────────────────────────────────────────
     const dateStr = req.query.date ?? new Date().toISOString().split('T')[0];
     const date    = new Date(dateStr);
     const from    = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(),  0,  0,  0));
     const to      = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59));
 
-    // ── Resolve today distance ────────────────────────────────────────────────
-    // Priority 1: DailySummary cache (written by analytics pipeline)
-    // Priority 2: analytics.service on-demand computation
-    // Priority 3: Vehicle.todayDistance live field (written by data.processor.js)
-    // Priority 4: zero — never throw, always return a usable shape
-
     let todayKm    = 0;
-    let totalKm    = vehicle.odometer ?? 0;
+    let totalKm    = vehicle.odometer      ?? 0;
     let engineHrs  = 0;
     let runningHrs = 0;
     let idleHrs    = 0;
@@ -325,7 +399,7 @@ exports.getMileageReport = async (req, res) => {
     let avgSpd     = 0;
     let tripCount  = 0;
 
-    // ── Try DailySummary first ────────────────────────────────────────────────
+    // ── Priority 1: DailySummary cache ────────────────────────────────────────
     let summary = null;
     try {
       summary = await DailySummary.findOne({
@@ -333,27 +407,24 @@ exports.getMileageReport = async (req, res) => {
         date:      from,
       }).lean();
     } catch (summaryErr) {
-      logger.warn('DailySummary lookup failed for vehicle %s: %s', req.params.id, summaryErr.message);
+      logger.warn('DailySummary lookup failed for %s: %s', req.params.id, summaryErr.message);
     }
 
     if (summary) {
-      // FIX-1: todayDistanceKm is the DAY distance field on DailySummary.
-      // If your DailySummary schema stores it as `totalDistance` (meaning
-      // distance-for-that-day), map it here. If it has a dedicated
-      // `todayDistanceKm` field, use that preferentially.
-      todayKm   = summary.todayDistanceKm ?? summary.totalDistance     ?? 0;
-      // FIX-4: totalDistanceKm is the ODOMETER — never the day distance.
-      totalKm   = summary.totalDistanceKm ?? summary.odometerKm        ?? vehicle.odometer ?? 0;
+      // FIX-1: day distance — separate from cumulative odometer
+      todayKm   = summary.todayDistanceKm  ?? summary.totalDistance     ?? 0;
+      // FIX-4: odometer — never the same as today distance
+      totalKm   = summary.totalDistanceKm  ?? summary.odometerKm        ?? vehicle.odometer ?? 0;
       // FIX-2: engine hours
-      engineHrs  = summary.engineHours    ?? summary.totalEngineHours  ?? 0;
-      runningHrs = summary.runningHours   ?? engineHrs;
-      idleHrs    = summary.idleHours      ?? 0;
-      maxSpd     = summary.maxSpeed       ?? maxSpd;
-      avgSpd     = summary.avgSpeed       ?? 0;
-      tripCount  = summary.tripCount      ?? 0;
+      engineHrs  = summary.engineHours     ?? summary.totalEngineHours  ?? 0;
+      runningHrs = summary.runningHours    ?? engineHrs;
+      idleHrs    = summary.idleHours       ?? 0;
+      maxSpd     = summary.maxSpeed        ?? maxSpd;
+      avgSpd     = summary.avgSpeed        ?? 0;
+      tripCount  = summary.tripCount       ?? 0;
 
     } else {
-      // ── Fallback: analytics.service ─────────────────────────────────────────
+      // ── Priority 2: analytics.service on-demand computation ─────────────────
       try {
         const { computeDailyFromRaw } = require('../services/analytics.service');
         const stats = await computeDailyFromRaw(
@@ -362,50 +433,47 @@ exports.getMileageReport = async (req, res) => {
           to
         );
         if (stats) {
-          todayKm   = stats.todayDistanceKm ?? stats.totalDistance    ?? 0;
-          totalKm   = stats.totalDistanceKm ?? stats.odometerKm       ?? vehicle.odometer ?? 0;
-          engineHrs  = stats.engineHours    ?? stats.totalEngineHours ?? 0;
-          runningHrs = stats.runningHours   ?? engineHrs;
-          idleHrs    = stats.idleHours      ?? 0;
-          maxSpd     = stats.maxSpeed       ?? maxSpd;
-          avgSpd     = stats.avgSpeed       ?? 0;
-          tripCount  = stats.tripCount      ?? 0;
+          todayKm    = stats.todayDistanceKm  ?? stats.totalDistance    ?? 0;
+          totalKm    = stats.totalDistanceKm  ?? stats.odometerKm       ?? vehicle.odometer ?? 0;
+          engineHrs  = stats.engineHours      ?? stats.totalEngineHours ?? 0;
+          runningHrs = stats.runningHours     ?? engineHrs;
+          idleHrs    = stats.idleHours        ?? 0;
+          maxSpd     = stats.maxSpeed         ?? maxSpd;
+          avgSpd     = stats.avgSpeed         ?? 0;
+          tripCount  = stats.tripCount        ?? 0;
         }
       } catch (analyticsErr) {
-        logger.warn('analytics.service not available for vehicle %s: %s', req.params.id, analyticsErr.message);
+        logger.warn('analytics.service unavailable for %s: %s', req.params.id, analyticsErr.message);
       }
 
-      // ── Final fallback: use vehicle's live running counters ─────────────────
-      // data.processor.js keeps todayDistance and todayEngineHours live on
-      // the Vehicle document so this is always non-zero during an active day.
+      // ── Priority 3: vehicle live counters (data.processor.js keeps these live)
       if (todayKm   === 0) todayKm   = vehicle.todayDistance    ?? 0;
       if (engineHrs === 0) engineHrs = vehicle.todayEngineHours ?? 0;
       if (totalKm   === 0) totalKm   = vehicle.odometer         ?? 0;
     }
 
-    // ── Response — every alias Flutter probes ─────────────────────────────────
+    // ── Response — every alias Flutter probes ──────────────────────────────────
     res.json({
       success: true,
       data: {
         vehicleId: req.params.id,
         date:      dateStr,
 
-        // FIX-1: Today distance — three aliases Flutter tries in order
+        // FIX-1: today distance — three aliases Flutter tries
         todayDistanceKm: todayKm,
         dailyDistance:   todayKm,
         distanceToday:   todayKm,
 
-        // FIX-4: Odometer (cumulative total) — three aliases, NEVER the same as today
+        // FIX-4: odometer (cumulative) — never the same value as today distance
         totalDistanceKm: totalKm,
         odometer:        totalKm,
         odometerKm:      totalKm,
 
-        // FIX-2: Engine hours — three aliases Flutter tries in order
+        // FIX-2: engine hours — three aliases Flutter tries
         engineHours:      engineHrs,
         totalEngineHours: engineHrs,
         runningHours:     runningHrs,
 
-        // Additional analytics
         idleHours: idleHrs,
         maxSpeed:  maxSpd,
         avgSpeed:  avgSpd,
@@ -420,10 +488,36 @@ exports.getMileageReport = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/vehicles
+//
+// FIX-SCOPE-2: phone and userId now always come from req.user (auth token),
+// never from the request body. Client cannot spoof ownership.
+// Also enforces the 16-vehicle limit (was only in routes/vehicles.js before).
 // ─────────────────────────────────────────────────────────────────────────────
 exports.createVehicle = async (req, res) => {
   try {
-    const vehicle = await Vehicle.create(req.body);
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+
+    // Enforce 16-vehicle limit
+    const count = await Vehicle.countDocuments({ phone });
+    if (count >= 16) {
+      return res.status(400).json({
+        success:  false,
+        message:  'Cannot register more than 16 vehicles per account',
+      });
+    }
+
+    // Strip phone/userId from body — must come from auth only
+    const { phone: _p, userId: _u, ...safeBody } = req.body;
+
+    const vehicle = await Vehicle.create({
+      ...safeBody,
+      phone,              // FIX-SCOPE-2: always from auth token
+      userId: req.user._id,
+    });
+
     res.status(201).json({
       success: true,
       message: 'Vehicle created',
@@ -431,7 +525,10 @@ exports.createVehicle = async (req, res) => {
     });
   } catch (err) {
     if (err.code === 11000) {
-      return res.status(400).json({ success: false, message: 'Vehicle with same IMEI already exists' });
+      return res.status(400).json({
+        success: false,
+        message: 'Vehicle with same registration number already exists',
+      });
     }
     res.status(400).json({ success: false, message: err.message });
   }
@@ -439,27 +536,42 @@ exports.createVehicle = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PUT /api/vehicles/:id
+//
+// FIX-SCOPE-5: Added ownership check before allowing update.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.updateVehicle = async (req, res) => {
   try {
-    // Prevent accidental overwrite of live telemetry fields from REST calls
-    const {
-      latitude, longitude, speed, status,
-      isOnline, lastUpdate,
-      ...safeBody
-    } = req.body;
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
 
-    const vehicle = await Vehicle.findByIdAndUpdate(
-      req.params.id,
-      safeBody,
-      { new: true, runValidators: true }
-    ).lean();
+    const vehicle = await Vehicle.findById(req.params.id).lean();
 
     if (!vehicle) {
       return res.status(404).json({ success: false, message: 'Vehicle not found' });
     }
 
-    res.json({ success: true, message: 'Vehicle updated', data: normalise(vehicle) });
+    // FIX-SCOPE-5: ownership check
+    if (vehicle.phone !== phone) {
+      return res.status(403).json({ success: false, message: 'Not authorized to update this vehicle' });
+    }
+
+    // Prevent accidental overwrite of live telemetry fields from REST calls
+    const {
+      latitude, longitude, speed,
+      isOnline, lastUpdate,
+      phone: _p, userId: _u,   // also strip auth fields
+      ...safeBody
+    } = req.body;
+
+    const updated = await Vehicle.findByIdAndUpdate(
+      req.params.id,
+      safeBody,
+      { new: true, runValidators: true }
+    ).lean();
+
+    res.json({ success: true, message: 'Vehicle updated', data: normalise(updated) });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }
@@ -467,15 +579,32 @@ exports.updateVehicle = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DELETE /api/vehicles/:id
+//
+// FIX-SCOPE-5: Added ownership check before allowing delete.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.deleteVehicle = async (req, res) => {
   try {
-    const vehicle = await Vehicle.findByIdAndDelete(req.params.id);
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+
+    const vehicle = await Vehicle.findById(req.params.id).select('phone name').lean();
+
     if (!vehicle) {
       return res.status(404).json({ success: false, message: 'Vehicle not found' });
     }
+
+    // FIX-SCOPE-5: ownership check
+    if (vehicle.phone !== phone) {
+      return res.status(403).json({ success: false, message: 'Not authorized to delete this vehicle' });
+    }
+
+    await Vehicle.findByIdAndDelete(req.params.id);
+
     res.json({ success: true, message: 'Vehicle deleted' });
   } catch (err) {
+    logger.error('deleteVehicle error: %s', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 };
@@ -483,23 +612,31 @@ exports.deleteVehicle = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/vehicles/:id/command
 //
-// Flutter calls sendCommand(vehicleId, commandName).
-// Commands: 'Cut Engine', 'Restore Engine', 'Sound Horn',
-//           'Reboot Device', 'Request Location', 'Device Settings'
+// FIX-SCOPE-6: Added ownership check before emitting socket command.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.sendCommand = async (req, res) => {
   try {
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+
     const { command } = req.body;
     if (!command) {
       return res.status(400).json({ success: false, message: 'command is required' });
     }
 
     const vehicle = await Vehicle.findById(req.params.id)
-      .select('imei name vehicleReg')
+      .select('imei name vehicleReg registrationNumber phone')
       .lean();
 
     if (!vehicle) {
       return res.status(404).json({ success: false, message: 'Vehicle not found' });
+    }
+
+    // FIX-SCOPE-6: ownership check
+    if (vehicle.phone !== phone) {
+      return res.status(403).json({ success: false, message: 'Not authorized to command this vehicle' });
     }
 
     if (global.io) {
@@ -512,11 +649,12 @@ exports.sendCommand = async (req, res) => {
       });
     }
 
-    logger.info('📡 Command [%s] sent to IMEI=%s by user=%s', command, vehicle.imei, req.user?._id);
+    const reg = vehicle.vehicleReg ?? vehicle.registrationNumber ?? vehicle.imei;
+    logger.info('📡 Command [%s] sent to IMEI=%s by user phone=%s', command, vehicle.imei, phone);
 
     res.json({
       success: true,
-      message: `Command "${command}" sent to ${vehicle.name || vehicle.imei}`,
+      message: `Command "${command}" sent to ${vehicle.name || reg}`,
     });
   } catch (err) {
     logger.error('sendCommand error: %s', err.message);
@@ -526,14 +664,22 @@ exports.sendCommand = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/vehicles/update-location  (called internally by GPS pipeline)
+//
+// This endpoint is called by the GPS data processor, NOT by the Flutter app.
+// It is intentionally NOT user-scoped — the GPS device authenticates via IMEI,
+// not via a user phone. Keep the protect middleware OFF this route in routes file.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.updateLocation = async (req, res) => {
   try {
     const {
       imei, latitude, longitude,
       speed, heading, address,
-      ignition, voltage,
+      ignition, voltage, satellites, accuracy,
     } = req.body;
+
+    if (!imei) {
+      return res.status(400).json({ success: false, message: 'imei is required' });
+    }
 
     const lat = req.body.lat ?? latitude;
     const lng = req.body.lng ?? longitude;
@@ -543,17 +689,20 @@ exports.updateLocation = async (req, res) => {
       {
         latitude:   lat,
         longitude:  lng,
-        speed:      speed    ?? 0,
-        heading:    heading  ?? 0,
-        ignition:   ignition ?? false,
-        voltage:    voltage  ?? 0,
+        speed:      speed      ?? 0,
+        heading:    heading    ?? 0,
+        ignition:   ignition   ?? false,
+        voltage:    voltage    ?? 0,
+        satellites: satellites ?? 0,
+        accuracy:   accuracy   ?? 0,
         isOnline:   true,
+        isLive:     true,
         lastUpdate: new Date(),
         ...(address && { address }),
         lastKnownLocation: {
           latitude:  lat,
           longitude: lng,
-          address,
+          address:   address ?? null,
           timestamp: new Date(),
         },
       },
@@ -561,22 +710,45 @@ exports.updateLocation = async (req, res) => {
     );
 
     if (!vehicle) {
-      return res.status(404).json({ success: false, message: 'IMEI not found' });
+      return res.status(404).json({ success: false, message: 'IMEI not registered' });
     }
 
-    if (global.io) global.io.emit('vehicle_movement', normalise(vehicle));
+    const normalised = normalise(vehicle);
 
-    res.json({ success: true, data: normalise(vehicle) });
+    // Emit to all connected Flutter clients — Flutter's socket guard (FIX-I)
+    // uses ownerId to filter out vehicles that don't belong to the current user.
+    if (global.io) global.io.emit('vehicle_movement', normalised);
+
+    res.json({ success: true, data: normalised });
   } catch (err) {
+    logger.error('updateLocation error: %s', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/vehicles/:id/alerts
+//
+// FIX-SCOPE-4: Added ownership check before returning alerts.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getVehicleAlerts = async (req, res) => {
   try {
+    const phone = req.user?.phone;
+    if (!phone) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+
+    // FIX-SCOPE-4: verify vehicle belongs to this user before returning its alerts
+    const vehicle = await Vehicle.findById(req.params.id).select('phone').lean();
+
+    if (!vehicle) {
+      return res.status(404).json({ success: false, message: 'Vehicle not found' });
+    }
+
+    if (vehicle.phone !== phone) {
+      return res.status(403).json({ success: false, message: 'Not authorized to access alerts for this vehicle' });
+    }
+
     const alerts = await Alert.find({ vehicleId: req.params.id })
       .sort({ timestamp: -1 })
       .limit(50)
@@ -584,6 +756,7 @@ exports.getVehicleAlerts = async (req, res) => {
 
     res.json({ success: true, count: alerts.length, data: alerts });
   } catch (err) {
+    logger.error('getVehicleAlerts error: %s', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 };
