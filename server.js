@@ -77,6 +77,7 @@ async function boot() {
   app.use('/api/referral', require('./routes/referral.routes'));
   app.use('/api/sync', require('./routes/sync.routes'));
   app.use('/api/web', require('./routes/inquiry.routes'));
+  app.use('/api/onboarding', require('./routes/onboarding.routes'));
 
 
   // ── Socket events ───────────────────────────────────────────────────────────
@@ -92,7 +93,7 @@ async function boot() {
   // ── Background services ─────────────────────────────────────────────────────
 
   // A. TCP GPS Server (GT06 hardware)
-  const GPS_PORT = parseInt(process.env.GPS_TCP_PORT ?? '5001', 10);
+  const GPS_PORT = parseInt(process.env.GPS_TCP_PORT ?? '5002', 10);
   require('./services/gps.server').startGpsServer(GPS_PORT);
 
   // B. WanWay cloud poller — UNCHANGED, existing customers unaffected
@@ -110,7 +111,7 @@ async function boot() {
   dailySummaryJob.start();
 
   // ── HTTP server ─────────────────────────────────────────────────────────────
-  const PORT = parseInt(process.env.PORT ?? '5000', 10);
+  const PORT = parseInt(process.env.PORT ?? '5001', 10);
   server.listen(PORT, '0.0.0.0', () =>
     logger.info('🚀 NVIQ Fleet Server online on port %d', PORT)
   );

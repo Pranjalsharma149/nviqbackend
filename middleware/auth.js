@@ -156,6 +156,11 @@ exports.requireRole = (...roles) => (req, res, next) => {
   next();
 };
 
+// ── cache invalidation (call after profile updates) ───────────────────────────
+exports.clearUserCache = (userId) => {
+  userCache.delete(userId.toString());
+};
+
 // ── optional auth (attaches user if token present, never blocks) ──────────────
 exports.optionalAuth = async (req, res, next) => {
   const header = req.headers.authorization || '';

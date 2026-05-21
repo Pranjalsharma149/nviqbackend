@@ -159,7 +159,47 @@ router.post('/verify-otp', async (req, res) => {
 // ── GET /api/auth/me ──────────────────────────────────────────────────────────
 // Get authenticated user's profile
 router.get('/me', protect, async (req, res) => {
-  res.json({ success: true, data: _userPayload(req.user) });
+  try {
+    const user = await User.findById(req.user._id)
+      .select('name firstName lastName email phone role status plan avatar location company onboardingStep onboardingComplete lastLogin')
+      .lean();
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    res.json({ success: true, data: { ..._userPayload(user), firstName: user.firstName, lastName: user.lastName, company: user.company, location: user.location, onboardingStep: user.onboardingStep, onboardingComplete: user.onboardingComplete } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── PUT /api/auth/me ──────────────────────────────────────────────────────────
+// Update authenticated user's profile
+router.put('/me', protect, async (req, res) => {
+  try {
+    const { clearUserCache } = require('../middleware/auth');
+    const update = {};
+    const textFields = ['name', 'phone', 'location', 'avatar', 'fcmToken'];
+    for (const field of textFields) {
+      if (req.body[field] !== undefined) {
+        update[field] = String(req.body[field]).trim();
+      }
+    }
+    if (req.body.email !== undefined) {
+      const email = String(req.body.email).toLowerCase().trim();
+      const taken = await User.findOne({ email, _id: { $ne: req.user._id } }).lean();
+      if (taken) return res.status(400).json({ success: false, message: 'Email already in use by another account' });
+      update.email = email;
+    }
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ success: false, message: 'No fields to update' });
+    }
+    clearUserCache(req.user._id.toString());
+    const user = await User.findByIdAndUpdate(req.user._id, update, { new: true, runValidators: true })
+      .select('name firstName lastName email phone role status plan avatar location company onboardingStep onboardingComplete lastLogin')
+      .lean();
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    res.json({ success: true, data: { ..._userPayload(user), firstName: user.firstName, lastName: user.lastName, company: user.company, location: user.location, onboardingStep: user.onboardingStep, onboardingComplete: user.onboardingComplete } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
 });
 
 // ── GET /api/auth/validate ────────────────────────────────────────────────────
