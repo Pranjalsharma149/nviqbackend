@@ -64,10 +64,12 @@ async function boot() {
   app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 2000, standardHeaders: true }));
 
   // ── Routes ──────────────────────────────────────────────────────────────────
+
   app.use('/api/auth', require('./routes/auth.routes'));
   app.use('/api/vehicles', require('./routes/vehicles.routes'));
   app.use('/api/tracking', require('./routes/tracking.routes'));
   app.use('/api/alerts', require('./routes/alerts.routes'));
+  app.use('/api/notifications',  require('./routes/notifications.routes'));  // ✨ NEW - Firebase notifications
   app.use('/api/analytics', require('./routes/analytics.routes'));
   app.use('/api/support', require('./routes/support.routes'));
   app.use('/api/geofences', require('./routes/geofence.routes'));
@@ -75,6 +77,7 @@ async function boot() {
   app.use('/api/referral', require('./routes/referral.routes'));
   app.use('/api/sync', require('./routes/sync.routes'));
   app.use('/api/web', require('./routes/inquiry.routes'));
+
 
   // ── Socket events ───────────────────────────────────────────────────────────
   io.on('connection', (socket) => {
