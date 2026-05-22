@@ -71,7 +71,7 @@ function gcj02ToWgs84(gcjLng, gcjLat) {
 // ── GPS Quality Check ─────────────────────────────────────────────────────────
 function _isGpsReliable(satellites, accuracy, speed) {
   if (satellites < 4)               return false;
-  if (accuracy > 50)                return false;
+  if (accuracy > 25)                return false;
   if (speed < 1 && accuracy > 10)   return false;
   return true;
 }
@@ -166,6 +166,49 @@ function _markStored(imei, lat, lng, ts) {
   _lastStored.set(imei, { lat, lng, ts });
 }
 
+// ── Bearing / heading consistency guard ──────────────────────────────────────
+// Tracks the last accepted (quality-passed) GPS point per IMEI so we can
+// compute the actual travel bearing and compare it to the device's reported
+// heading. A large mismatch while accuracy is poor = post-turn GPS drift.
+const _lastGoodPoint = new Map(); // imei → { lat, lng }
+
+function _bearingDeg(lat1, lng1, lat2, lng2) {
+  const dLng  = (lng2 - lng1) * Math.PI / 180;
+  const lat1r = lat1 * Math.PI / 180;
+  const lat2r = lat2 * Math.PI / 180;
+  const y = Math.sin(dLng) * Math.cos(lat2r);
+  const x = Math.cos(lat1r) * Math.sin(lat2r) - Math.sin(lat1r) * Math.cos(lat2r) * Math.cos(dLng);
+  return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+}
+
+function _headingDiff(a, b) {
+  const d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
+
+// Returns false when the point looks like a post-turn GPS drift artefact:
+//   distance from last good point must be > 30m (short hops are unreliable for bearing),
+//   heading vs calculated bearing must differ by > 90° AND accuracy must be > 20m.
+function _isBearingConsistent(imei, lat, lng, deviceHeading, accuracy) {
+  const prev = _lastGoodPoint.get(imei);
+  if (!prev) return true;
+
+  const distKm = haversineKm(prev.lat, prev.lng, lat, lng);
+  if (distKm < 0.030) return true; // < 30 m: bearing calc is unreliable
+
+  const bearing = _bearingDeg(prev.lat, prev.lng, lat, lng);
+  const diff    = _headingDiff(deviceHeading, bearing);
+
+  if (diff > 90 && accuracy > 20) {
+    logger.debug(
+      '⚠️ [BearingGuard] IMEI=%s device=%d° calc=%d° diff=%d° acc=%dm — point rejected',
+      imei, Math.round(deviceHeading), Math.round(bearing), Math.round(diff), Math.round(accuracy)
+    );
+    return false;
+  }
+  return true;
+}
+
 // ── Daily distance accumulator ────────────────────────────────────────────────
 const _dailyDist = new Map();
 
@@ -237,6 +280,7 @@ setInterval(() => {
   for (const [imei, state] of _tripState.entries()) {
     if (!state.tripId) _tripState.delete(imei);
   }
+  _lastGoodPoint.clear(); // reset bearing baseline daily
   logger.info('[Processor] Pruned daily accumulators');
 }, 24 * 60 * 60 * 1000);
 
@@ -552,31 +596,46 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     }
   }
 
-  // 8b. Store LocationPing
+  // 8b. Store LocationPing — only when GPS quality and bearing are trustworthy.
+  // Poor-accuracy post-turn drift points still land in RawGpsLog above but are
+  // excluded from the route visualization layer to prevent zig-zag rendering.
+  const gpsQualityOk = _isGpsReliable(dev.satellites, dev.accuracy, dev.speed);
+  const bearingOk    = hasValidGPS
+    ? _isBearingConsistent(dev.imei, lat, lng, dev.heading, dev.accuracy)
+    : true;
+
   if (hasValidGPS && !isDuplicate) {
-    try {
-      await LocationPing.create({
-        vehicleId:        vehicleId.toString(),
-        imei:             dev.imei,
-        latitude:         lat,
-        longitude:        lng,
-        speed:            dev.speed,
-        heading:          dev.heading,
-        altitude:         dev.altitude,
-        accuracy:         dev.accuracy,
-        satellites:       dev.satellites,
-        batteryVoltage:   dev.voltage,
-        ignitionOn:       effectiveIgnition,
-        gpsTime:          gpsTs,
-        deviceTime:       now,
-        address:          null,
-        serverOdometerKm: dev.odometer ?? 0,
-        todayDistance:    todayDistKm,
-        engineHours:      engineHrs,
-        source:           dev.source,
-      });
-    } catch (err) {
-      logger.error('❌ [Processor] LocationPing insert failed for IMEI=%s: %s', dev.imei, err.message);
+    if (gpsQualityOk && bearingOk) {
+      _lastGoodPoint.set(dev.imei, { lat, lng });
+      try {
+        await LocationPing.create({
+          vehicleId:        vehicleId.toString(),
+          imei:             dev.imei,
+          latitude:         lat,
+          longitude:        lng,
+          speed:            dev.speed,
+          heading:          dev.heading,
+          altitude:         dev.altitude,
+          accuracy:         dev.accuracy,
+          satellites:       dev.satellites,
+          batteryVoltage:   dev.voltage,
+          ignitionOn:       effectiveIgnition,
+          gpsTime:          gpsTs,
+          deviceTime:       now,
+          address:          null,
+          serverOdometerKm: dev.odometer ?? 0,
+          todayDistance:    todayDistKm,
+          engineHours:      engineHrs,
+          source:           dev.source,
+        });
+      } catch (err) {
+        logger.error('❌ [Processor] LocationPing insert failed for IMEI=%s: %s', dev.imei, err.message);
+      }
+    } else {
+      logger.debug(
+        '⚠️ [Processor] LocationPing skipped IMEI=%s — quality=%s bearing=%s acc=%dm',
+        dev.imei, gpsQualityOk, bearingOk, Math.round(dev.accuracy)
+      );
     }
   }
 
