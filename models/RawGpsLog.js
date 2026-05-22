@@ -57,8 +57,8 @@ const RawGpsLogSchema = new mongoose.Schema(
     // ── Status ────────────────────────────────────────────────────────────────
     status: {
       type:    String,
-      enum:    ['moving', 'idle', 'offline'],
-      default: 'idle',
+      enum:    ['parked', 'moving', 'idle', 'offline'],  // ← FIXED: Added 'parked'
+      default: 'parked',  // ← FIXED: Changed from 'idle' to 'parked'
     },
 
     // ── Source ────────────────────────────────────────────────────────────────
