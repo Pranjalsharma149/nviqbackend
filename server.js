@@ -143,6 +143,9 @@ async function boot() {
   app.use('/api/trips',          require('./routes/trip.routes'));
   app.use('/api/referral',       require('./routes/referral.routes'));
   app.use('/api/sync',           require('./routes/sync.routes'));
+  app.use('/api/web',            require('./routes/inquiry.routes'));
+  app.use('/api/onboarding',     require('./routes/onboarding.routes'));
+
 
   // ── Socket events ───────────────────────────────────────────────────────────
   io.on('connection', (socket) => {
