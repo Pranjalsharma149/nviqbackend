@@ -5,28 +5,39 @@ const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
 
 const userSchema = new mongoose.Schema({
-  name:     { type: String, required: [true, 'Name is required'], trim: true, maxlength: 80 },
-  email:    { type: String, required: [true, 'Email is required'], unique: true, lowercase: true, trim: true, match: [/^\S+@\S+\.\S+$/, 'Invalid email'] },
-  password: { type: String, required: [true, 'Password is required'], minlength: 6, select: false },
-  phone:    { type: String, trim: true, sparse: true },
-  role:     { type: String, enum: ['admin','fleet_manager','driver','supervisor'], default: 'fleet_manager' },
-  
+  name:      { type: String, required: [true, 'Name is required'], trim: true, maxlength: 80 },
+  firstName: { type: String, trim: true, maxlength: 50 },
+  lastName:  { type: String, trim: true, maxlength: 50 },
+  email:     { type: String, required: [true, 'Email is required'], unique: true, lowercase: true, trim: true, match: [/^\S+@\S+\.\S+$/, 'Invalid email'] },
+  password:  { type: String, required: [true, 'Password is required'], minlength: 6, select: false },
+  phone:     { type: String, trim: true, sparse: true },
+  role:      { type: String, enum: ['admin', 'fleet_manager', 'dispatcher', 'operations', 'owner', 'driver', 'supervisor'], default: 'fleet_manager' },
+
+  company:      { type: String, trim: true, maxlength: 100 },
+  fleetSize:    { type: String, trim: true },
+  vehicleTypes: [{ type: String, trim: true }],
+  fleetId:      { type: String, trim: true, sparse: true, index: true },
+  logo:         { type: String, trim: true },
+
+  onboardingStep:     { type: Number, default: 0 },
+  onboardingComplete: { type: Boolean, default: false },
+
   status:   { type: String, enum: ['active', 'inactive', 'suspended'], default: 'active', index: true },
-  
+
   plan:     { type: String, default: 'Free Plan' },
   location: { type: String, trim: true },
   avatar:   { type: String },
-  fcmToken: { type: String }, // Store for Firebase Push Notifications
+  fcmToken: { type: String },
 
   resetPasswordToken:  { type: String, select: false },
   resetPasswordExpire: { type: Date,   select: false },
 
   // ── Referral system ──────────────────────────────────────────────────────
-referralCode:    { type: String, unique: true, sparse: true },
-referredBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
-referralApplied: { type: Boolean, default: false },
-credits:         { type: Number, default: 0 },
-credits:  { type: Number, default: 0 }, // ← referral credit balance shown in UI
+  referralCode:    { type: String, unique: true, sparse: true },
+  referredBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  referralApplied: { type: Boolean, default: false },
+  credits:         { type: Number, default: 0 },
+
   lastLogin: { type: Date },
 }, {
   timestamps: true,

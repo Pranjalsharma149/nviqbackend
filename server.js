@@ -1,14 +1,14 @@
 'use strict';
 
 require('dotenv').config();
-const express    = require('express');
-const http       = require('http');
-const socketIo   = require('socket.io');
-const cors       = require('cors');
-const helmet     = require('helmet');
-const morgan     = require('morgan');
-const rateLimit  = require('express-rate-limit');
-const connectDB  = require('./config/db');
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const connectDB = require('./config/db');
 const seedDevices = require('./scripts/seedDevices');
 const logger     = require('./utils/logger');
 
@@ -25,10 +25,10 @@ try {
     const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
       ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
       : {
-          projectId:    process.env.FIREBASE_PROJECT_ID,
-          clientEmail:  process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey:   process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-        };
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      };
     if (!serviceAccount.projectId) throw new Error('Missing Firebase Config');
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     logger.info('🔥 Firebase Admin initialized');
@@ -46,16 +46,16 @@ async function boot() {
     await seedDevices();
   }
 
-  const app    = express();
+  const app = express();
   const server = http.createServer(app);
 
   // 3. Socket.IO
   const io = socketIo(server, {
-    cors:       { origin: '*', methods: ['GET', 'POST'] },
+    cors: { origin: '*', methods: ['GET', 'POST'] },
     transports: ['websocket'],
     pingInterval: 10000,
-    pingTimeout:  5000,
-    bufferSize:   1e6,
+    pingTimeout: 5000,
+    bufferSize: 1e6,
   });
   global.io = io;
 
@@ -157,7 +157,7 @@ async function boot() {
   // ── Background services ─────────────────────────────────────────────────────
 
   // A. TCP GPS Server (GT06 hardware)
-  const GPS_PORT = parseInt(process.env.GPS_TCP_PORT ?? '5001', 10);
+  const GPS_PORT = parseInt(process.env.GPS_TCP_PORT ?? '5002', 10);
   require('./services/gps.server').startGpsServer(GPS_PORT);
 
   // B. WanWay IOP GPS Poller

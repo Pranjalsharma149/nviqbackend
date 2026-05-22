@@ -32,6 +32,45 @@ const LocationPing = require('../models/LocationPing');
 
 const TAG = '[TripPlaybackCtrl]';
 
+// ── Post-turn zig-zag outlier filter ─────────────────────────────────────────
+// Removes GPS drift artefacts by checking whether visiting a point creates a
+// detour more than 2.5× the direct distance between its neighbors. Points that
+// pass the quality/bearing checks in data.processor may still form a small kink
+// on screen — this removes the last visible residue.
+
+function _distKm(lat1, lng1, lat2, lng2) {
+  const R    = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lng2 - lng1) * Math.PI / 180;
+  const a    = Math.sin(dLat / 2) ** 2 +
+               Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+               Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function _filterZigZag(points) {
+  if (points.length < 3) return points;
+
+  const out = [points[0]];
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = out[out.length - 1];
+    const curr = points[i];
+    const next = points[i + 1];
+
+    const dPC = _distKm(prev.lat, prev.lng, curr.lat, curr.lng);
+    const dCN = _distKm(curr.lat, curr.lng, next.lat, next.lng);
+    const dPN = _distKm(prev.lat, prev.lng, next.lat, next.lng);
+
+    // Skip point if it creates a detour > 2.5× the direct prev→next path.
+    // Minimum direct distance of 5 m prevents false positives on slow/stopped vehicles.
+    if (dPN > 0.005 && (dPC + dCN) > dPN * 2.5) continue;
+
+    out.push(curr);
+  }
+  out.push(points[points.length - 1]);
+  return out;
+}
+
 function dayBounds(dateStr) {
   const start = new Date(dateStr);
   start.setHours(0, 0, 0, 0);
@@ -68,7 +107,7 @@ exports.tripPoints = async (req, res) => {
       return res.json({ code: 0, data: [], message: 'No trip data for this date' });
     }
 
-    const points = pings.map(p => ({
+    const raw = pings.map(p => ({
       id:          p._id?.toString(),
       lat:         p.latitude,
       lng:         p.longitude,
@@ -85,14 +124,17 @@ exports.tripPoints = async (req, res) => {
       address:     p.address     ?? null,
     }));
 
-    console.log(`${TAG} tripPoints: ${points.length} pts for ${vehicleId} on ${date}`);
+    const points = _filterZigZag(raw);
+
+    console.log(`${TAG} tripPoints: ${points.length}/${raw.length} pts for ${vehicleId} on ${date}`);
     return res.json({
       code: 0,
       data: points,
       metadata: {
-        count:     points.length,
-        startTime: points[0].timestamp,
-        endTime:   points[points.length - 1].timestamp,
+        count:        points.length,
+        originalCount: raw.length,
+        startTime:    points[0].timestamp,
+        endTime:      points[points.length - 1].timestamp,
       },
     });
   } catch (err) {
@@ -118,12 +160,12 @@ exports.playbackData = async (req, res) => {
 
     if (!all.length) return res.json({ code: 0, data: [] });
 
-    const sampled = [];
+    const rawSampled = [];
     let lastMs = null;
     for (const p of all) {
       const ms = p.gpsTime.getTime();
       if (lastMs === null || (ms - lastMs) / 1000 >= stepSec) {
-        sampled.push({
+        rawSampled.push({
           id:        p._id?.toString(),
           lat:       p.latitude,
           lng:       p.longitude,
@@ -139,6 +181,8 @@ exports.playbackData = async (req, res) => {
         lastMs = ms;
       }
     }
+
+    const sampled = _filterZigZag(rawSampled);
 
     console.log(`${TAG} playbackData: sampled ${sampled.length}/${all.length} pts (interval=${stepSec}s)`);
     return res.json({
