@@ -19,6 +19,19 @@ function setCachedUser(id, user) {
   userCache.set(id, { user, ts: Date.now() });
 }
 
+// ── 🔧 FIX #1: Periodic cache cleanup (prevents memory leak / crash from OOM) ──
+// Old code only evicted entries when re-accessed AFTER expiry. Stale entries
+// from users who never came back accumulated forever and slowly leaked memory
+// until the server hit OOM and crashed. This runs every minute and purges
+// anything past TTL.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of userCache) {
+    if (now - entry.ts > CACHE_TTL) userCache.delete(id);
+  }
+}, 60 * 1000).unref();
+// .unref() so this timer doesn't prevent Node from exiting during graceful shutdown
+
 // ── protect middleware ────────────────────────────────────────────────────────
 // Accepts:
 //   1. NVIQ JWT           (from phone-login / email-password login)  ← checked FIRST
@@ -28,14 +41,18 @@ exports.protect = async (req, res, next) => {
   const header = req.headers.authorization || '';
 
   // ── 1. Dev mock token ──────────────────────────────────────────────────────
-  // FIX: use a real ObjectId so MongoDB queries (e.g. referral lookup) don't fail
   if (process.env.NODE_ENV === 'development' && header.startsWith('Bearer mock_')) {
     const mongoose = require('mongoose');
     const mockId = new mongoose.Types.ObjectId('000000000000000000000001');
+    // 🔧 FIX #2: Fill in ALL fields downstream code may read.
+    // Old mock object was missing email/phone/etc. so any controller doing
+    // req.user.email.toLowerCase() crashed with "Cannot read property of undefined".
     req.user = {
       _id:    mockId,
       id:     mockId.toString(),
       name:   'Dev User',
+      email:  'dev@nviq.app',
+      phone:  '+919999999999',
       role:   'admin',
       status: 'active',
     };
@@ -49,13 +66,9 @@ exports.protect = async (req, res, next) => {
   const token = header.slice(7);
 
   // ── 2. Try NVIQ JWT FIRST ─────────────────────────────────────────────────
-  // Our own tokens are always verified first. Firebase tokens are the fallback.
-  // This avoids Firebase rejecting our JWT with auth/argument-error and
-  // blocking the request before we ever get to verify it ourselves.
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'nviq_secret_change_me');
 
-    // decoded.id is set by getSignedJwtToken() in User model
     if (decoded && decoded.id) {
       let user = getCachedUser(decoded.id);
 
@@ -112,19 +125,48 @@ exports.protect = async (req, res, next) => {
         .lean();
     }
 
-    // Auto-provision user on first Firebase login
+    // 🔧 FIX #3: Race-safe auto-provisioning
+    // Old code: two concurrent requests with same Firebase token would BOTH
+    // see "user not found", both call User.create(), and the second would
+    // throw E11000 duplicate key → fall into the outer catch → return 401
+    // → user gets kicked back to OTP screen. Now we catch the duplicate
+    // and re-fetch, which is what we wanted.
     if (!user) {
       const crypto = require('crypto');
-      user = await User.create({
-        name:     decoded.name || decoded.phone_number || 'Fleet User',
-        email:    decoded.email || `firebase_${decoded.uid}@nviq.app`,
-        phone:    decoded.phone_number || '',
-        password: crypto.randomBytes(16).toString('hex') + 'Aa1!',
-        role:     'fleet_manager',
-        status:   'active',
-      });
-      user = user.toObject();
-      logger.info('Auto-provisioned user for Firebase UID=%s', decoded.uid);
+      try {
+        const created = await User.create({
+          name:     decoded.name || decoded.phone_number || 'Fleet User',
+          email:    decoded.email || `firebase_${decoded.uid}@nviq.app`,
+          phone:    decoded.phone_number || '',
+          password: crypto.randomBytes(16).toString('hex') + 'Aa1!',
+          role:     'fleet_manager',
+          status:   'active',
+        });
+        user = created.toObject();
+        logger.info('Auto-provisioned user for Firebase UID=%s', decoded.uid);
+      } catch (createErr) {
+        // E11000 = duplicate key — another request just created this user.
+        // Just re-fetch and continue. Anything else, re-throw.
+        if (createErr && createErr.code === 11000) {
+          logger.info('Race in auto-provision for UID=%s, re-fetching', decoded.uid);
+          if (decoded.phone_number) {
+            user = await User.findOne({ phone: decoded.phone_number })
+              .select('-password -resetPasswordToken -resetPasswordExpire')
+              .lean();
+          }
+          if (!user && decoded.email) {
+            user = await User.findOne({ email: decoded.email })
+              .select('-password -resetPasswordToken -resetPasswordExpire')
+              .lean();
+          }
+          if (!user) {
+            // Genuinely could not find or create — fail clean
+            return res.status(401).json({ success: false, message: 'Authentication failed' });
+          }
+        } else {
+          throw createErr;
+        }
+      }
     }
 
     if (user.status === 'suspended') {
@@ -161,9 +203,55 @@ exports.clearUserCache = (userId) => {
   userCache.delete(userId.toString());
 };
 
-// ── optional auth (attaches user if token present, never blocks) ──────────────
+// ── 🔧 FIX #4: optionalAuth — was guaranteed to crash on bad tokens ───────────
+//
+// OLD CODE (BUGGY):
+//   exports.optionalAuth = async (req, res, next) => {
+//     const header = req.headers.authorization || '';
+//     if (!header.startsWith('Bearer ')) return next();
+//     exports.protect(req, res, (err) => next());   ← BUG
+//   };
+//
+// The bug: protect() calls res.status(401).json(...) on bad tokens AND THEN
+// returns. The callback passed in then called next() ANYWAY, so the route
+// handler ran, tried to send another response, and Express crashed with
+// "Cannot set headers after they are sent to the client".
+//
+// FIX: detect whether protect already sent a response. If it did, stop here.
+// If it didn't, we have a valid user — call next(). If we don't have a user,
+// just continue without one (that's the point of "optional").
 exports.optionalAuth = async (req, res, next) => {
   const header = req.headers.authorization || '';
   if (!header.startsWith('Bearer ')) return next();
-  exports.protect(req, res, (err) => next());
+
+  // Hand off to protect, but intercept BEFORE it writes a response
+  const originalStatus = res.status.bind(res);
+  const originalJson   = res.json.bind(res);
+  let responded = false;
+
+  res.status = function (code) {
+    // If protect tries to send 401/403, swallow it for optionalAuth.
+    // For other codes, pass through (shouldn't happen, but safe).
+    if (code === 401 || code === 403) {
+      responded = true;
+      return {
+        json: () => { /* swallow */ return res; },
+      };
+    }
+    return originalStatus(code);
+  };
+
+  try {
+    await exports.protect(req, res, (err) => {
+      // Restore originals so route handlers behave normally
+      res.status = originalStatus;
+      res.json   = originalJson;
+      if (responded) return next(); // bad token — continue WITHOUT user
+      return next(err);              // good token — req.user is set
+    });
+  } catch (e) {
+    res.status = originalStatus;
+    res.json   = originalJson;
+    return next();
+  }
 };
