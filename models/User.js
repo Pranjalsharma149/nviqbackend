@@ -8,8 +8,8 @@ const userSchema = new mongoose.Schema({
   name:      { type: String, required: [true, 'Name is required'], trim: true, maxlength: 80 },
   firstName: { type: String, trim: true, maxlength: 50 },
   lastName:  { type: String, trim: true, maxlength: 50 },
-  email:     { type: String, required: [true, 'Email is required'], unique: true, lowercase: true, trim: true, match: [/^\S+@\S+\.\S+$/, 'Invalid email'] },
-  password:  { type: String, required: [true, 'Password is required'], minlength: 6, select: false },
+  email:     { type: String, unique: true, sparse: true, lowercase: true, trim: true, match: [/^\S+@\S+\.\S+$/, 'Invalid email'] },
+  password:  { type: String, minlength: 6, select: false },
   phone:     { type: String, trim: true, sparse: true },
   role:      { type: String, enum: ['admin', 'fleet_manager', 'dispatcher', 'operations', 'owner', 'driver', 'supervisor'], default: 'fleet_manager' },
 
@@ -61,7 +61,7 @@ userSchema.methods.getSignedJwtToken = function () {
   return jwt.sign(
     { id: this._id, role: this.role },
     process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    { expiresIn: process.env.JWT_EXPIRES_IN || '180d' }
   );
 };
 

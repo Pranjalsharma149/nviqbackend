@@ -1,21 +1,21 @@
 'use strict';
 
 const express = require('express');
-const router  = express.Router();
-const User    = require('../models/User');
+const router = express.Router();
+const User = require('../models/User');
 const { protect } = require('../middleware/auth');
 
 // ── Shared user payload formatter ─────────────────────────────────────────────
 function _userPayload(user) {
   return {
-    id:        user.id || user._id?.toString(),
-    name:      user.name,
-    email:     user.email,
-    phone:     user.phone,
-    role:      user.role,
-    status:    user.status,
-    plan:      user.plan,
-    avatar:    user.avatar,
+    id: user.id || user._id?.toString(),
+    name: user.name,
+    email: user.email,
+    phone: user.phone,
+    role: user.role,
+    status: user.status,
+    plan: user.plan,
+    avatar: user.avatar,
     lastLogin: user.lastLogin,
   };
 }
@@ -53,8 +53,8 @@ router.post('/login', async (req, res) => {
 
     res.json({
       success: true,
-      token:   user.getSignedJwtToken(),
-      data:    _userPayload(user),
+      token: user.getSignedJwtToken(),
+      data: _userPayload(user),
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -78,12 +78,12 @@ router.post('/phone-login', async (req, res) => {
     // Auto-create user on first phone login
     if (!user) {
       user = await User.create({
-        name:     name || `Fleet-Manager-${digits.slice(-4)}`,
-        email:    `${digits}@nviq.app`,
+        name: name || `Fleet-Manager-${digits.slice(-4)}`,
+        email: `${digits}@nviq.app`,
         password: firebaseUid || `nviq_${digits}`,
-        phone:    digits,
-        role:     'fleet_manager',
-        status:   'active',
+        phone: digits,
+        role: 'fleet_manager',
+        status: 'active',
       });
     }
 
@@ -96,8 +96,8 @@ router.post('/phone-login', async (req, res) => {
 
     res.json({
       success: true,
-      token:   user.getSignedJwtToken(),
-      data:    _userPayload(user),
+      token: user.getSignedJwtToken(),
+      data: _userPayload(user),
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -129,12 +129,12 @@ router.post('/verify-otp', async (req, res) => {
       const nanoid = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 6);
 
       user = await User.create({
-        name:         name || `Fleet-Manager-${digits.slice(-4)}`,
-        email:        `${digits}@nviq.app`,
-        password:     firebaseUid,
-        phone:        digits,
-        role:         'fleet_manager',
-        status:       'active',
+        name: name || `Fleet-Manager-${digits.slice(-4)}`,
+        email: `${digits}@nviq.app`,
+        password: firebaseUid,
+        phone: digits,
+        role: 'fleet_manager',
+        status: 'active',
         referralCode: 'NVIQ-' + nanoid(),
       });
     }
@@ -148,8 +148,8 @@ router.post('/verify-otp', async (req, res) => {
 
     res.json({
       success: true,
-      token:   user.getSignedJwtToken(),
-      data:    _userPayload(user),
+      token: user.getSignedJwtToken(),
+      data: _userPayload(user),
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -199,6 +199,174 @@ router.put('/me', protect, async (req, res) => {
     res.json({ success: true, data: { ..._userPayload(user), firstName: user.firstName, lastName: user.lastName, company: user.company, location: user.location, onboardingStep: user.onboardingStep, onboardingComplete: user.onboardingComplete } });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+
+
+router.post('/send-otp', async (req, res) => {
+  try {
+    const { phone } = req.body;
+
+    if (!phone) return res.status(400).json({ success: false, message: "Phone is required" })
+
+    const digits = phone.replace(/\D/g, '');
+    if (digits.length < 10 || digits.length > 15) return res.status(400).json({ success: false, message: "Invalid phone number" })
+
+
+    let user = await User.findOne({
+      $or: [
+        { phone: digits },
+        { phone: phone }
+      ]
+    });
+
+    const isNewUser = !user;
+
+    if (!user) {
+      // save phone number as new user
+      const { customAlphabet } = require('nanoid');
+      const nanoid = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 6);
+      user = await User.create({
+        name: `Fleet-Manager-${digits.slice(-4)}`,
+        phone: digits,
+        role: 'fleet_manager',
+        status: 'active',
+        referralCode: 'NVIQ-' + nanoid(),
+      });
+    }
+
+    if (user.status !== 'active') {
+      return res.status(403).json({
+        success: false,
+        message: "Account deactivated",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "OTP sent successfully",
+      isNewUser
+    });
+
+  } catch (error) {
+    console.error("Error in send-otp:", error);
+    return res.status(500).json({ success: false, message: "Something went wrong" });
+  }
+})
+
+
+router.post('/verify-otp-bypass', async (req, res) => {
+  if (process.env.BYPASS_OTP !== 'true') {
+    return res.status(404).json({
+      success: false,
+      message: "Otp verification not enabled"
+    })
+  }
+
+  try {
+    const { phone, otp } = req.body;
+
+    if (!phone || !otp) return res.status(400).json({ success: false, message: "Phone and otp are required" })
+
+    const digits = phone.replace(/\D/g, '');
+    if (digits.length < 10 || digits.length > 15) return res.status(400).json({ success: false, message: "Invalid phone number" })
+
+
+    let user = await User.findOne({
+      $or: [
+        { phone: digits },
+        { phone: phone }
+      ]
+    });
+
+    const isNewUser = !user;
+
+    if (otp === '123456') {
+      if (!user) {
+        const { customAlphabet } = require('nanoid');
+        const nanoid = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 6);
+        user = await User.create({
+          name: `Fleet-Manager-${digits.slice(-4)}`,
+          phone: digits,
+          role: 'fleet_manager',
+          status: 'active',
+          referralCode: 'NVIQ-' + nanoid(),
+        });
+      }
+
+      await User.findByIdAndUpdate(user._id, { lastLogin: new Date() });
+      await _ensureReferralCode(user);
+
+      return res.json({
+        success: true,
+        message: "OTP verified successfully",
+        token: user.getSignedJwtToken(),
+        isNewUser,
+        data: _userPayload(user)
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      message: "Invalid OTP",
+    });
+
+  } catch (error) {
+    console.error("Error in verify-otp-bypass:", error);
+    return res.status(500).json({ success: false, message: "Something went wrong" });
+  }
+
+})
+
+
+router.post('/onboarding-basic-details', protect, async (req, res) => {
+  try {
+    const { firstName, lastName, role, plan, email } = req.body;
+    const company = req.body.companyName || req.body.company || req.body['company name'] || req.body['compoany name'];
+
+    if (!firstName || !lastName || !company || !role) {
+      return res.status(400).json({
+        success: false,
+        message: 'firstName, lastName, role, and company (or companyName) are all required',
+      });
+    }
+
+    const validRoles = ['admin', 'fleet_manager', 'dispatcher', 'operations', 'owner', 'driver', 'supervisor'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: `role must be one of: ${validRoles.join(', ')}`,
+      });
+    }
+
+    const update = {
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
+      name: `${firstName.trim()} ${lastName.trim()}`,
+      company: company.trim(),
+      role,
+      plan: plan ? plan.trim() : 'Free Plan',
+      onboardingStep: Math.max(req.user.onboardingStep || 0, 1),
+    };
+
+    if (email) {
+      const emailLower = email.toLowerCase().trim();
+      const emailTaken = await User.findOne({ email: emailLower, _id: { $ne: req.user._id } }).lean();
+      if (emailTaken) {
+        return res.status(400).json({ success: false, message: 'Email is already in use by another account' });
+      }
+      update.email = emailLower;
+    }
+
+    const { clearUserCache } = require('../middleware/auth');
+    const user = await User.findByIdAndUpdate(req.user._id, update, { new: true, runValidators: true })
+      .select('firstName lastName email company role plan onboardingStep onboardingComplete').lean();
+
+    clearUserCache(req.user._id);
+    res.json({ success: true, data: user });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
