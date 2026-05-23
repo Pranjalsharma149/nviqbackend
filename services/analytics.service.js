@@ -21,6 +21,16 @@
  *     RawGpsLog, not just Trip aggregates.
  *   - avgSpeed in getFleetSummary() is the fleet moving-vehicle average,
  *     not the mean of instantaneous Vehicle.speed values.
+ *
+ * 🔧 BUGFIX (this version):
+ *   Removed infinite-recursion exports at the bottom of the file.
+ *   Previously, lines like
+ *       module.exports.getFleetSummary = (...a) => AnalyticsService.getFleetSummary(...a)
+ *   overwrote the class's own static methods (because module.exports IS
+ *   AnalyticsService), causing every analytics endpoint to crash with
+ *   "Maximum call stack size exceeded". The class's static methods are
+ *   already accessible via module.exports (= AnalyticsService) without
+ *   the wrapper lines.
  */
 
 const mongoose     = require('mongoose');
@@ -517,25 +527,11 @@ class AnalyticsService {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Exports
-//
-// Default export is the class (preserves existing usage:
-//   const AnalyticsService = require('./analytics.service')
-//   AnalyticsService.getFleetSummary()
-//
-// Named exports satisfy the cron job and analytics routes which
-// import by destructuring:
-//   const { computeDailyFromRaw, utcDayStart } = require('./analytics.service')
-// ─────────────────────────────────────────────────────────────────────────────
+
 module.exports = AnalyticsService;
 
-module.exports.computeDailyFromRaw   = computeDailyFromRaw;
-module.exports.utcDayStart           = utcDayStart;
-module.exports.utcDayEnd             = utcDayEnd;
-module.exports.getDailyAnalytics     = (...a) => AnalyticsService.getDailyAnalytics(...a);
-module.exports.getDateRangeAnalytics = (...a) => AnalyticsService.getDateRangeAnalytics(...a);
-module.exports.getTrips              = (...a) => AnalyticsService.getTrips(...a);
-module.exports.getPlayback           = (...a) => AnalyticsService.getPlayback(...a);
-module.exports.getLiveStats          = (...a) => AnalyticsService.getLiveStats(...a);
-module.exports.getFleetSummary       = (...a) => AnalyticsService.getFleetSummary(...a);
+// Named utility exports (these are plain functions, not class methods,
+// so attaching them here does NOT cause recursion).
+module.exports.computeDailyFromRaw = computeDailyFromRaw;
+module.exports.utcDayStart         = utcDayStart;
+module.exports.utcDayEnd           = utcDayEnd;
