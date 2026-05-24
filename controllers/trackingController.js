@@ -82,18 +82,18 @@ function buildSocketPayload(v) {
     status:    v.status  ?? 'offline',
 
     // Flutter FIX-3: ignition — all aliases
-    ignition:    v.ignition ?? false,
-    ignitionOn:  v.ignition ?? false,
-    acc:         v.ignition ?? false,
-    ACC:         v.ignition ?? false,
-    engine:      v.ignition ?? false,
+    ignition:    v.ignitionOn ?? false,
+    ignitionOn:  v.ignitionOn ?? false,
+    acc:         v.ignitionOn ?? false,
+    ACC:         v.ignitionOn ?? false,
+    engine:      v.ignitionOn ?? false,
     ignitionSince: v.ignitionSince ? new Date(v.ignitionSince).toISOString() : null,
 
     // Flutter FIX-2: battery voltage — all aliases
-    voltage:          v.voltage ?? 0,
-    battery:          v.voltage ?? 0,
-    bat:              v.voltage ?? 0,
-    external_voltage: v.voltage ?? 0,
+    voltage:          v.batteryVoltage ?? 0,
+    battery:          v.batteryVoltage ?? 0,
+    bat:              v.batteryVoltage ?? 0,
+    external_voltage: v.batteryVoltage ?? 0,
 
     // GPS quality
     satellites: v.satellites ?? 0,
@@ -142,7 +142,7 @@ exports.getLiveVehicles = async (req, res) => {
       .select([
         'name', 'vehicleReg', 'type', 'imei', 'protocol',
         'latitude', 'longitude', 'speed', 'heading', 'status',
-        'isOnline', 'isLive', 'ignition', 'ignitionSince', 'voltage', 'satellites', 'accuracy',
+        'isOnline', 'isLive', 'ignitionOn', 'ignitionSince', 'batteryVoltage', 'satellites', 'accuracy',
         'address', 'lastUpdate', 'lastOnlineAt', 'lastKnownLocation',
         'todayDistance', 'todayEngineHours', 'todayMaxSpeed',
         'odometer', 'pocName', 'pocContact', 'speedLimit', 'analytics',
@@ -194,15 +194,15 @@ exports.getLiveVehicles = async (req, res) => {
         status:  v.status  ?? 'offline',
 
         // Flutter FIX-3: ignition
-        ignition:      v.ignition ?? false,
-        ignitionOn:    v.ignition ?? false,
-        acc:           v.ignition ?? false,
+        ignition:      v.ignitionOn ?? false,
+        ignitionOn:    v.ignitionOn ?? false,
+        acc:           v.ignitionOn ?? false,
         ignitionSince: v.ignitionSince ? new Date(v.ignitionSince).toISOString() : null,
 
         // Flutter FIX-2: battery
-        batteryVoltage: v.voltage ?? 0,
-        voltage:        v.voltage ?? 0,
-        battery:        v.voltage ?? 0,
+        batteryVoltage: v.batteryVoltage ?? 0,
+        voltage:        v.batteryVoltage ?? 0,
+        battery:        v.batteryVoltage ?? 0,
 
         satellites: v.satellites ?? 0,
         accuracy:   v.accuracy   ?? 0,
@@ -293,9 +293,9 @@ exports.batchUpdate = async (req, res) => {
 
       const baseSet = {
         speed,
-        heading:   parseFloat(u.heading ?? u.course) || 0,
-        ignition,
-        voltage:   parseFloat(u.voltage ?? u.extVoltage) || 0,
+        heading:        parseFloat(u.heading ?? u.course) || 0,
+        ignitionOn:     ignition,
+        batteryVoltage: parseFloat(u.voltage ?? u.extVoltage) || 0,
         satellites: parseInt(u.satellites ?? u.gpsNum ?? 0, 10),
         accuracy:   parseFloat(u.accuracy ?? u.hdop)   || 0,
         odometer:   parseFloat(u.odometer ?? u.mileage) || 0,
@@ -316,7 +316,7 @@ exports.batchUpdate = async (req, res) => {
           longitude: lng,
           speed,
           heading:   baseSet.heading,
-          voltage:   baseSet.voltage,
+          voltage:   baseSet.batteryVoltage,
           odometer:  baseSet.odometer,
           address:   u.address ?? null,
           timestamp: u.timestamp ? new Date(u.timestamp) : now,

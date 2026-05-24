@@ -716,9 +716,9 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   };
 
   if (dev.ignition !== null && dev.ignition !== undefined) {
-    vehicleUpdate.ignition = dev.ignition;
+    vehicleUpdate.ignitionOn = dev.ignition;
   } else {
-    vehicleUpdate.ignition = effectiveIgnition;
+    vehicleUpdate.ignitionOn = effectiveIgnition;
   }
   vehicleUpdate.ignitionSince = ignitionSince ?? null;
 
@@ -727,7 +727,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     vehicleUpdate.longitude = lng;
     vehicleUpdate.lat       = lat;
     vehicleUpdate.lng       = lng;
-    if (dev.voltage  != null) vehicleUpdate.voltage  = dev.voltage;
+    if (dev.voltage  != null) vehicleUpdate.batteryVoltage = dev.voltage;
     vehicleUpdate.lastKnownLocation = {
       latitude:   lat,
       longitude:  lng,
