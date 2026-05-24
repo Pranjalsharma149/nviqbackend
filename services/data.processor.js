@@ -219,13 +219,31 @@ const _ignitionState = new Map();
 function _updateIgnitionSince(imei, currentIgnition, ts) {
   const prev = _ignitionState.get(imei);
 
-  if (prev && prev.ignitionOn === currentIgnition) {
+  if (prev && prev.ignitionOn === currentIgnition && prev.since) {
     // State has not changed — keep the existing transition timestamp
     return prev.since;
   }
 
   // State changed (or first-ever point) — update timestamp to current GPS timestamp
   _ignitionState.set(imei, { ignitionOn: currentIgnition, since: ts });
+  return ts;
+}
+
+// ── Status state tracker (detects moving/idle/parked/offline transitions) ──────
+// imei → { status: string, since: Date }
+const _statusState = new Map();
+
+// Returns the statusSince Date for this IMEI:
+//   - If status changes, sets `since` to `ts`.
+//   - If status remains the same, returns the existing `since`.
+function _updateStatusSince(imei, currentStatus, ts) {
+  const prev = _statusState.get(imei);
+
+  if (prev && prev.status === currentStatus && prev.since) {
+    return prev.since;
+  }
+
+  _statusState.set(imei, { status: currentStatus, since: ts });
   return ts;
 }
 
@@ -557,7 +575,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
 
   // 5. Resolve vehicle
   const vehicle = await Vehicle.findOne({ imei: dev.imei })
-    .select('_id imei lastKnownLocation odometer ignitionOn ignitionSince')
+    .select('_id imei lastKnownLocation odometer ignitionOn ignitionSince statusSince status')
     .lean();
   if (!vehicle) {
     logger.warn('⚠️ [Processor] Unknown IMEI=%s — not in DB', dev.imei);
@@ -573,8 +591,19 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     });
   }
 
+  // Seed status state from DB if not already in memory
+  if (!_statusState.has(dev.imei)) {
+    _statusState.set(dev.imei, {
+      status: vehicle.status || 'offline',
+      since: vehicle.statusSince || vehicle.lastUpdate || null,
+    });
+  }
+
   // 3b. Ignition since — track when ignition last flipped ON or OFF
   const ignitionSince = _updateIgnitionSince(dev.imei, effectiveIgnition, gpsTs);
+
+  // 3c. Status since — track when status last changed
+  const statusSince = _updateStatusSince(dev.imei, status, gpsTs);
 
   // 6. Duplicate guard
   let isDuplicate = false;
@@ -721,6 +750,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     vehicleUpdate.ignitionOn = effectiveIgnition;
   }
   vehicleUpdate.ignitionSince = ignitionSince ?? null;
+  vehicleUpdate.statusSince   = statusSince;
 
   if (hasValidGPS) {
     vehicleUpdate.latitude  = lat;
@@ -796,6 +826,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       power:            effectiveIgnition,
       // When ignition turned ON — Flutter uses this to calculate "ignition for X mins"
       ignitionSince:    ignitionSince ? ignitionSince.toISOString() : null,
+      statusSince:      statusSince ? statusSince.toISOString() : null,
 
       satellites:       dev.satellites,
       accuracy:         dev.accuracy,

@@ -88,6 +88,7 @@ function buildSocketPayload(v) {
     ACC:         v.ignitionOn ?? false,
     engine:      v.ignitionOn ?? false,
     ignitionSince: v.ignitionSince ? new Date(v.ignitionSince).toISOString() : null,
+    statusSince:   v.statusSince   ? new Date(v.statusSince).toISOString()   : null,
 
     // Flutter FIX-2: battery voltage — all aliases
     voltage:          v.batteryVoltage ?? 0,
@@ -142,7 +143,7 @@ exports.getLiveVehicles = async (req, res) => {
       .select([
         'name', 'vehicleReg', 'type', 'imei', 'protocol',
         'latitude', 'longitude', 'speed', 'heading', 'status',
-        'isOnline', 'isLive', 'ignitionOn', 'ignitionSince', 'batteryVoltage', 'satellites', 'accuracy',
+        'isOnline', 'isLive', 'ignitionOn', 'ignitionSince', 'statusSince', 'batteryVoltage', 'satellites', 'accuracy',
         'address', 'lastUpdate', 'lastOnlineAt', 'lastKnownLocation',
         'todayDistance', 'todayEngineHours', 'todayMaxSpeed',
         'odometer', 'pocName', 'pocContact', 'speedLimit', 'analytics',
@@ -198,6 +199,7 @@ exports.getLiveVehicles = async (req, res) => {
         ignitionOn:    v.ignitionOn ?? false,
         acc:           v.ignitionOn ?? false,
         ignitionSince: v.ignitionSince ? new Date(v.ignitionSince).toISOString() : null,
+        statusSince:   v.statusSince   ? new Date(v.statusSince).toISOString()   : null,
 
         // Flutter FIX-2: battery
         batteryVoltage: v.batteryVoltage ?? 0,

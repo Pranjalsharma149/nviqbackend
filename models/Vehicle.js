@@ -266,6 +266,12 @@ const vehicleSchema = new mongoose.Schema(
       comment: 'Timestamp when ignition last turned ON (null = ignition is OFF)',
     },
 
+    statusSince: {
+      type:    Date,
+      default: () => new Date(),
+      comment: 'Timestamp when vehicle status last changed',
+    },
+
     temperature: {
       type:    Number,
       default: 0,
