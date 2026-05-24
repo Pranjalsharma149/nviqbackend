@@ -214,27 +214,19 @@ function _isBearingConsistent(imei, lat, lng, deviceHeading, accuracy) {
 const _ignitionState = new Map();
 
 // Returns the ignitionSince Date for this IMEI:
-//   - If ignition just turned ON (transition), sets `since` to `ts` and persists it.
-//   - If ignition was already ON, returns the existing `since`.
-//   - If ignition is OFF, clears `since` and returns null.
+//   - If ignition state changes (transition ON→OFF or OFF→ON), sets `since` to `ts`.
+//   - If ignition state remains the same, returns the existing `since`.
 function _updateIgnitionSince(imei, currentIgnition, ts) {
   const prev = _ignitionState.get(imei);
 
-  if (!currentIgnition) {
-    _ignitionState.set(imei, { ignitionOn: false, since: null });
-    return null;
+  if (prev && prev.ignitionOn === currentIgnition) {
+    // State has not changed — keep the existing transition timestamp
+    return prev.since;
   }
 
-  // Ignition is ON
-  if (!prev || !prev.ignitionOn) {
-    // Transition OFF → ON (or first-ever point with ignition ON)
-    _ignitionState.set(imei, { ignitionOn: true, since: ts });
-    return ts;
-  }
-
-  // Already ON — keep the existing start time
-  _ignitionState.set(imei, { ignitionOn: true, since: prev.since });
-  return prev.since;
+  // State changed (or first-ever point) — update timestamp to current GPS timestamp
+  _ignitionState.set(imei, { ignitionOn: currentIgnition, since: ts });
+  return ts;
 }
 
 // ── Daily distance accumulator ────────────────────────────────────────────────
@@ -555,9 +547,6 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     ignitionSource    = 'inferred';
   }
 
-  // 3b. Ignition since — track when ignition last flipped ON
-  const ignitionSince = _updateIgnitionSince(dev.imei, effectiveIgnition, gpsTs);
-
   // 4. Online / status
   const isOnline = (Date.now() - signalTs.getTime()) < 5 * 60 * 1000;
   const status   = !isOnline
@@ -568,13 +557,24 @@ async function processIncomingData(rawDevice, source = 'wanway') {
 
   // 5. Resolve vehicle
   const vehicle = await Vehicle.findOne({ imei: dev.imei })
-    .select('_id imei lastKnownLocation odometer')
+    .select('_id imei lastKnownLocation odometer ignitionOn ignitionSince')
     .lean();
   if (!vehicle) {
     logger.warn('⚠️ [Processor] Unknown IMEI=%s — not in DB', dev.imei);
     return;
   }
   const vehicleId = vehicle._id;
+
+  // Seed ignition state from DB if not already in memory
+  if (!_ignitionState.has(dev.imei)) {
+    _ignitionState.set(dev.imei, {
+      ignitionOn: vehicle.ignitionOn || false,
+      since: vehicle.ignitionSince || null,
+    });
+  }
+
+  // 3b. Ignition since — track when ignition last flipped ON or OFF
+  const ignitionSince = _updateIgnitionSince(dev.imei, effectiveIgnition, gpsTs);
 
   // 6. Duplicate guard
   let isDuplicate = false;
