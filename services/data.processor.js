@@ -209,6 +209,34 @@ function _isBearingConsistent(imei, lat, lng, deviceHeading, accuracy) {
   return true;
 }
 
+// ── Ignition state tracker (detects OFF→ON transitions) ──────────────────────
+// imei → { ignitionOn: bool, since: Date|null }
+const _ignitionState = new Map();
+
+// Returns the ignitionSince Date for this IMEI:
+//   - If ignition just turned ON (transition), sets `since` to `ts` and persists it.
+//   - If ignition was already ON, returns the existing `since`.
+//   - If ignition is OFF, clears `since` and returns null.
+function _updateIgnitionSince(imei, currentIgnition, ts) {
+  const prev = _ignitionState.get(imei);
+
+  if (!currentIgnition) {
+    _ignitionState.set(imei, { ignitionOn: false, since: null });
+    return null;
+  }
+
+  // Ignition is ON
+  if (!prev || !prev.ignitionOn) {
+    // Transition OFF → ON (or first-ever point with ignition ON)
+    _ignitionState.set(imei, { ignitionOn: true, since: ts });
+    return ts;
+  }
+
+  // Already ON — keep the existing start time
+  _ignitionState.set(imei, { ignitionOn: true, since: prev.since });
+  return prev.since;
+}
+
 // ── Daily distance accumulator ────────────────────────────────────────────────
 const _dailyDist = new Map();
 
@@ -527,6 +555,9 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     ignitionSource    = 'inferred';
   }
 
+  // 3b. Ignition since — track when ignition last flipped ON
+  const ignitionSince = _updateIgnitionSince(dev.imei, effectiveIgnition, gpsTs);
+
   // 4. Online / status
   const isOnline = (Date.now() - signalTs.getTime()) < 5 * 60 * 1000;
   const status   = !isOnline
@@ -689,6 +720,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   } else {
     vehicleUpdate.ignition = effectiveIgnition;
   }
+  vehicleUpdate.ignitionSince = ignitionSince ?? null;
 
   if (hasValidGPS) {
     vehicleUpdate.latitude  = lat;
@@ -762,6 +794,8 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       engine:           effectiveIgnition,
       engineOn:         effectiveIgnition,
       power:            effectiveIgnition,
+      // When ignition turned ON — Flutter uses this to calculate "ignition for X mins"
+      ignitionSince:    ignitionSince ? ignitionSince.toISOString() : null,
 
       satellites:       dev.satellites,
       accuracy:         dev.accuracy,
