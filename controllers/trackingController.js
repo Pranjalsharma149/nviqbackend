@@ -1,39 +1,39 @@
 'use strict';
 
-const Vehicle      = require('../models/Vehicle');
+const Vehicle = require('../models/Vehicle');
 const LocationPing = require('../models/LocationPing');
-const RawGpsLog    = require('../models/RawGpsLog');
-const GPSEngine    = require('./geofenceController');
-const logger       = require('../utils/logger');
+const RawGpsLog = require('../models/RawGpsLog');
+const GPSEngine = require('./geofenceController');
+const logger = require('../utils/logger');
 
 // ── GCJ-02 → WGS-84 ──────────────────────────────────────────────────────────
 // This is not neccessory because the Wanway GPS is already providing wgs84 coordinates but gcj02 is required for other gps devices basically it is used in China. and It adds a purposeful random offset (shift) to GPS coordinates for security reasons
 
 function gcj02ToWgs84(gcjLng, gcjLat) {
-  const a  = 6378245.0;
+  const a = 6378245.0;
   const ee = 0.00669342162296594323;
 
   function transformLat(lng, lat) {
-    let r = -100 + 2*lng + 3*lat + 0.2*lat*lat + 0.1*lng*lat + 0.2*Math.sqrt(Math.abs(lng));
-    r += (20*Math.sin(6*lng*Math.PI) + 20*Math.sin(2*lng*Math.PI)) * 2/3;
-    r += (20*Math.sin(lat*Math.PI)   + 40*Math.sin(lat/3*Math.PI)) * 2/3;
-    r += (160*Math.sin(lat/12*Math.PI) + 320*Math.sin(lat*Math.PI/30)) * 2/3;
+    let r = -100 + 2 * lng + 3 * lat + 0.2 * lat * lat + 0.1 * lng * lat + 0.2 * Math.sqrt(Math.abs(lng));
+    r += (20 * Math.sin(6 * lng * Math.PI) + 20 * Math.sin(2 * lng * Math.PI)) * 2 / 3;
+    r += (20 * Math.sin(lat * Math.PI) + 40 * Math.sin(lat / 3 * Math.PI)) * 2 / 3;
+    r += (160 * Math.sin(lat / 12 * Math.PI) + 320 * Math.sin(lat * Math.PI / 30)) * 2 / 3;
     return r;
   }
 
   function transformLng(lng, lat) {
-    let r = 300 + lng + 2*lat + 0.1*lng*lng + 0.1*lng*lat + 0.1*Math.sqrt(Math.abs(lng));
-    r += (20*Math.sin(6*lng*Math.PI) + 20*Math.sin(2*lng*Math.PI)) * 2/3;
-    r += (20*Math.sin(lng*Math.PI)   + 40*Math.sin(lng/3*Math.PI)) * 2/3;
-    r += (150*Math.sin(lng/12*Math.PI) + 300*Math.sin(lng/30*Math.PI)) * 2/3;
+    let r = 300 + lng + 2 * lat + 0.1 * lng * lng + 0.1 * lng * lat + 0.1 * Math.sqrt(Math.abs(lng));
+    r += (20 * Math.sin(6 * lng * Math.PI) + 20 * Math.sin(2 * lng * Math.PI)) * 2 / 3;
+    r += (20 * Math.sin(lng * Math.PI) + 40 * Math.sin(lng / 3 * Math.PI)) * 2 / 3;
+    r += (150 * Math.sin(lng / 12 * Math.PI) + 300 * Math.sin(lng / 30 * Math.PI)) * 2 / 3;
     return r;
   }
 
-  const dLat      = transformLat(gcjLng - 105, gcjLat - 35);
-  const dLng      = transformLng(gcjLng - 105, gcjLat - 35);
-  const radLat    = gcjLat / 180 * Math.PI;
-  let   magic     = Math.sin(radLat);
-  magic           = 1 - ee * magic * magic;
+  const dLat = transformLat(gcjLng - 105, gcjLat - 35);
+  const dLng = transformLng(gcjLng - 105, gcjLat - 35);
+  const radLat = gcjLat / 180 * Math.PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - ee * magic * magic;
   const sqrtMagic = Math.sqrt(magic);
 
   return {
@@ -45,10 +45,10 @@ function gcj02ToWgs84(gcjLng, gcjLat) {
 // ── Coord validity ────────────────────────────────────────────────────────────
 function isValidCoord(lat, lng) {
   if (lat == null || lng == null) return false;
-  if (isNaN(lat)  || isNaN(lng))  return false;
-  if (lat === 0   && lng === 0)   return false;
-  if (lat < -90   || lat > 90)    return false;
-  if (lng < -180  || lng > 180)   return false;
+  if (isNaN(lat) || isNaN(lng)) return false;
+  if (lat === 0 && lng === 0) return false;
+  if (lat < -90 || lat > 90) return false;
+  if (lng < -180 || lng > 180) return false;
   // Reject old hardcoded Delhi default
   if (Math.abs(lat - 28.6139) < 0.01 && Math.abs(lng - 77.209) < 0.01) return false;
   return true;
@@ -62,74 +62,74 @@ function isValidCoord(lat, lng) {
 function buildSocketPayload(v) {
   return {
     // Identity — Flutter checks multiple field names
-    id:        v._id.toString(),
+    id: v._id.toString(),
     vehicleId: v._id.toString(),
-    imei:      v.imei,
-    IMEI:      v.imei,
-    deviceId:  v.imei,
+    imei: v.imei,
+    IMEI: v.imei,
+    deviceId: v.imei,
 
     // Coordinates
-    lat:       v.latitude,
-    lng:       v.longitude,
-    latitude:  v.latitude,
+    lat: v.latitude,
+    lng: v.longitude,
+    latitude: v.latitude,
     longitude: v.longitude,
 
     // Motion
-    speed:     v.speed   ?? 0,
-    heading:   v.heading ?? 0,
-    course:    v.heading ?? 0,
+    speed: v.speed ?? 0,
+    heading: v.heading ?? 0,
+    course: v.heading ?? 0,
     direction: v.heading ?? 0,
-    status:    v.status  ?? 'offline',
+    status: v.status ?? 'offline',
 
     // Flutter FIX-3: ignition — all aliases
-    ignition:    v.ignitionOn ?? false,
-    ignitionOn:  v.ignitionOn ?? false,
-    acc:         v.ignitionOn ?? false,
-    ACC:         v.ignitionOn ?? false,
-    engine:      v.ignitionOn ?? false,
+    ignition: v.ignitionOn ?? false,
+    ignitionOn: v.ignitionOn ?? false,
+    acc: v.ignitionOn ?? false,
+    ACC: v.ignitionOn ?? false,
+    engine: v.ignitionOn ?? false,
     ignitionSince: v.ignitionSince ? new Date(v.ignitionSince).toISOString() : null,
-    statusSince:   v.statusSince   ? new Date(v.statusSince).toISOString()   : null,
+    statusSince: v.statusSince ? new Date(v.statusSince).toISOString() : null,
 
     // Flutter FIX-2: battery voltage — all aliases
-    voltage:          v.batteryVoltage ?? 0,
-    battery:          v.batteryVoltage ?? 0,
-    bat:              v.batteryVoltage ?? 0,
+    voltage: v.batteryVoltage ?? 0,
+    battery: v.batteryVoltage ?? 0,
+    bat: v.batteryVoltage ?? 0,
     external_voltage: v.batteryVoltage ?? 0,
 
     // GPS quality
     satellites: v.satellites ?? 0,
-    sats:       v.satellites ?? 0,
-    accuracy:   v.accuracy   ?? 0,
-    hdop:       v.accuracy   ?? 0,
+    sats: v.satellites ?? 0,
+    accuracy: v.accuracy ?? 0,
+    hdop: v.accuracy ?? 0,
 
     // Online state
     isOnline: v.isOnline ?? false,
-    isLive:   v.isLive   ?? false,
+    isLive: v.isLive ?? false,
 
     // Timestamps — Flutter checks multiple field names
-    gpsTime:    v.lastUpdate,
-    timestamp:  v.lastUpdate,
+    gpsTime: v.lastUpdate,
+    timestamp: v.lastUpdate,
     deviceTime: v.lastUpdate,
-    dt:         v.lastUpdate,
-    ts:         v.lastUpdate,
+    dt: v.lastUpdate,
+    ts: v.lastUpdate,
 
     // Flutter FIX-1: today distance — all aliases
-    todayDistance:  v.todayDistance ?? 0,
-    todayKm:        v.todayDistance ?? 0,
-    today_km:       v.todayDistance ?? 0,
-    dailyDistance:  v.todayDistance ?? 0,
+    todayDistance: v.todayDistance ?? 0,
+    todayKm: v.todayDistance ?? 0,
+    today_km: v.todayDistance ?? 0,
+    dailyDistance: v.todayDistance ?? 0,
 
     // Flutter FIX-4: odometer — all aliases
-    odometer:      v.odometer ?? 0,
-    mileage:       v.odometer ?? 0,
+    odometer: v.odometer ?? 0,
+    mileage: v.odometer ?? 0,
     totalDistance: v.odometer ?? 0,
-    totalKm:       v.odometer ?? 0,
+    totalKm: v.odometer ?? 0,
 
     // Address
-    address:  v.address ?? v.lastKnownLocation?.address ?? '',
+    address: v.address ?? v.lastKnownLocation?.address ?? '',
     location: v.address ?? '',
 
-    lastUpdate:  v.lastUpdate,
+    lastUpdate: v.lastUpdate,
     lastOnlineAt: v.lastOnlineAt,
   };
 }
@@ -145,7 +145,7 @@ exports.getLiveVehicles = async (req, res) => {
         'latitude', 'longitude', 'speed', 'heading', 'status',
         'isOnline', 'isLive', 'ignitionOn', 'ignitionSince', 'statusSince', 'batteryVoltage', 'satellites', 'accuracy',
         'address', 'lastUpdate', 'lastOnlineAt', 'lastKnownLocation',
-        'todayDistance', 'todayEngineHours', 'todayMaxSpeed',
+        'todayDistance', 'todayEngineHours', 'todayMaxSpeed', 'todayStops',
         'odometer', 'pocName', 'pocContact', 'speedLimit', 'analytics',
       ].join(' '))
       .limit(2000)
@@ -165,92 +165,112 @@ exports.getLiveVehicles = async (req, res) => {
       // Offline duration
       let offlineDuration = null;
       if (!v.isOnline && v.lastOnlineAt) {
-        const ms  = Date.now() - new Date(v.lastOnlineAt).getTime();
+        const ms = Date.now() - new Date(v.lastOnlineAt).getTime();
         const min = Math.floor(ms / 60000);
-        const d   = Math.floor(min / 1440);
-        const h   = Math.floor((min % 1440) / 60);
-        const m   = min % 60;
+        const d = Math.floor(min / 1440);
+        const h = Math.floor((min % 1440) / 60);
+        const m = min % 60;
         offlineDuration = d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
       }
+
+      let parkingDuration = null;
+      let parkingSeconds = 0;
+      if (v.status !== 'moving' && v.statusSince) {
+        const ms = Date.now() - new Date(v.statusSince).getTime();
+        parkingSeconds = Math.floor(ms / 1000);
+        const min = Math.floor(ms / 60000);
+        const d = Math.floor(min / 1440);
+        const h = Math.floor((min % 1440) / 60);
+        const m = min % 60;
+        parkingDuration = d > 0 ? `${d}d ${h}h ${m}m` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+      }
+
+
 
       const address = v.address || lkl?.address || null;
 
       return {
-        id:          v._id.toString(),
-        vehicleId:   v._id.toString(),
-        name:        v.name,
-        vehicleReg:  v.vehicleReg,
-        type:        v.type,
+        id: v._id.toString(),
+        vehicleId: v._id.toString(),
+        name: v.name,
+        vehicleReg: v.vehicleReg,
+        type: v.type,
         vehicleTypeKey: v.type,
-        imei:        v.imei,
-        protocol:    v.protocol,
+        imei: v.imei,
+        protocol: v.protocol,
 
         // Coordinates
         lat, lng,
         latitude: lat, longitude: lng,
 
         // Motion
-        speed:   v.speed   ?? 0,
+        speed: v.speed ?? 0,
         heading: v.heading ?? 0,
-        status:  v.status  ?? 'offline',
+        status: v.status ?? 'offline',
+
+        // today stops
+        todayStops: v.todayStops ?? 0,
 
         // Flutter FIX-3: ignition
-        ignition:      v.ignitionOn ?? false,
-        ignitionOn:    v.ignitionOn ?? false,
-        acc:           v.ignitionOn ?? false,
+        ignition: v.ignitionOn ?? false,
+        ignitionOn: v.ignitionOn ?? false,
+        acc: v.ignitionOn ?? false,
         ignitionSince: v.ignitionSince ? new Date(v.ignitionSince).toISOString() : null,
-        statusSince:   v.statusSince   ? new Date(v.statusSince).toISOString()   : null,
+        statusSince: v.statusSince ? new Date(v.statusSince).toISOString() : null,
 
         // Flutter FIX-2: battery
         batteryVoltage: v.batteryVoltage ?? 0,
-        voltage:        v.batteryVoltage ?? 0,
-        battery:        v.batteryVoltage ?? 0,
+        voltage: v.batteryVoltage ?? 0,
+        battery: v.batteryVoltage ?? 0,
 
         satellites: v.satellites ?? 0,
-        accuracy:   v.accuracy   ?? 0,
+        accuracy: v.accuracy ?? 0,
 
         isOnline: v.isOnline ?? false,
-        isLive:   v.isLive   ?? false,
+        isLive: v.isLive ?? false,
 
         // Address — all aliases Flutter checks
         address,
-        location:             address,
-        formattedLocation:    address,
+        location: address,
+        formattedLocation: address,
         formattedLocationStr: address,
-        liveAddress:          address,
+        liveAddress: address,
 
         lastKnownLocation: lkl ? {
-          latitude:  lkl.latitude,
+          latitude: lkl.latitude,
           longitude: lkl.longitude,
-          speed:     lkl.speed,
-          heading:   lkl.heading,
-          voltage:   lkl.voltage,
-          odometer:  lkl.odometer,
-          address:   lkl.address,
+          speed: lkl.speed,
+          heading: lkl.heading,
+          voltage: lkl.voltage,
+          odometer: lkl.odometer,
+          address: lkl.address,
           timestamp: lkl.timestamp,
         } : (lat ? { latitude: lat, longitude: lng, address, timestamp: v.lastUpdate } : null),
 
-        lastUpdate:     v.lastUpdate,
-        lastGpsTime:    v.lastUpdate,
-        lastOnlineAt:   v.lastOnlineAt,
+        lastUpdate: v.lastUpdate,
+        lastGpsTime: v.lastUpdate,
+        lastOnlineAt: v.lastOnlineAt,
         offlineDuration,
+        parkingDuration,
+        parkingSeconds,
+        parkingSince: v.status !== 'moving' && v.statusSince ? new Date(v.statusSince).toISOString() : null,
 
         // Flutter FIX-1: today distance
-        todayDistanceKm:  v.todayDistance    ?? 0,
-        todayDistance:    v.todayDistance    ?? 0,
+        todayDistanceKm: v.todayDistance ?? 0,
+        todayDistance: v.todayDistance ?? 0,
         // Flutter FIX-4: odometer
-        totalDistanceKm:  v.odometer         ?? 0,
-        odometer:         v.odometer         ?? 0,
+        totalDistanceKm: v.odometer ?? 0,
+        odometer: v.odometer ?? 0,
         // Flutter FIX-2: engine hours
         engineHoursToday: v.todayEngineHours ?? 0,
         todayEngineHours: v.todayEngineHours ?? 0,
-        todayMaxSpeed:    v.todayMaxSpeed    ?? 0,
+        todayMaxSpeed: v.todayMaxSpeed ?? 0,
 
-        pocName:    v.pocName    ?? '',
+        pocName: v.pocName ?? '',
         pocContact: v.pocContact ?? '',
         speedLimit: v.speedLimit ?? 80,
-        analytics:  v.analytics  ?? {},
-        timestamp:  v.lastUpdate,
+        analytics: v.analytics ?? {},
+        timestamp: v.lastUpdate,
       };
     });
 
@@ -272,55 +292,64 @@ exports.batchUpdate = async (req, res) => {
     }
 
     const bulkOps = [];
-    const now     = new Date();
+    const now = new Date();
 
     for (const u of updates) {
       if (!u.imei) continue;
 
       const isOnline = u.isOnline !== undefined ? Boolean(u.isOnline) : true;
-      const rawLat   = u.latitude  != null ? parseFloat(u.latitude)  : null;
-      const rawLng   = u.longitude != null ? parseFloat(u.longitude) : null;
+      const rawLat = u.latitude != null ? parseFloat(u.latitude) : null;
+      const rawLng = u.longitude != null ? parseFloat(u.longitude) : null;
 
       let lat = null, lng = null;
       if (rawLat != null && rawLng != null && !isNaN(rawLat) && !isNaN(rawLng)) {
         // const wgs = gcj02ToWgs84(rawLng, rawLat);
-        lat =rawLat; 
+        lat = rawLat;
         lng = rawLng;
       }
 
       const hasValidGPS = isValidCoord(lat, lng);
-      const speed       = parseFloat(u.speed) || 0;
-      const ignition    = u.acc != null ? Boolean(u.acc) : (u.ignition ?? false);
-      const status      = speed > 2 ? 'moving' : (ignition ? 'idle' : 'offline');
+      const speed = parseFloat(u.speed) || 0;
+      const ignition = u.acc != null ? Boolean(u.acc) : (u.ignition ?? false);
+      const status = speed > 2 ? 'moving' : (ignition ? 'idle' : 'offline');
+      const previousStatus = u.status || 'offline';
+      let currentStatus = status;
+
 
       const baseSet = {
         speed,
-        heading:        parseFloat(u.heading ?? u.course) || 0,
-        ignitionOn:     ignition,
+        heading: parseFloat(u.heading ?? u.course) || 0,
+        ignitionOn: ignition,
         batteryVoltage: parseFloat(u.voltage ?? u.extVoltage) || 0,
         satellites: parseInt(u.satellites ?? u.gpsNum ?? 0, 10),
-        accuracy:   parseFloat(u.accuracy ?? u.hdop)   || 0,
-        odometer:   parseFloat(u.odometer ?? u.mileage) || 0,
+        accuracy: parseFloat(u.accuracy ?? u.hdop) || 0,
+        odometer: parseFloat(u.odometer ?? u.mileage) || 0,
         status,
         isOnline,
+        todayStops: u.todayStops || 0,
         isLive: isOnline,
         lastUpdate: u.timestamp ? new Date(u.timestamp) : now,
       };
 
+
+      if (previousStatus === 'moving' && currentStatus !== 'moving') {
+        baseSet.$inc = { todayStops: 1 };
+      }
+
       if (hasValidGPS) {
-        baseSet.latitude      = lat;
-        baseSet.longitude     = lng;
-        baseSet.gpsSignal     = true;
-        baseSet.lastOnlineAt  = u.timestamp ? new Date(u.timestamp) : now;
-        baseSet.address       = u.address ?? null;
+        baseSet.latitude = lat;
+        baseSet.longitude = lng;
+        baseSet.gpsSignal = true;
+        baseSet.lastOnlineAt = u.timestamp ? new Date(u.timestamp) : now;
+        baseSet.address = u.address ?? null;
         baseSet.lastKnownLocation = {
-          latitude:  lat,
+          latitude: lat,
           longitude: lng,
           speed,
-          heading:   baseSet.heading,
-          voltage:   baseSet.batteryVoltage,
-          odometer:  baseSet.odometer,
-          address:   u.address ?? null,
+          heading: baseSet.heading,
+          voltage: baseSet.batteryVoltage,
+          odometer: baseSet.odometer,
+          address: u.address ?? null,
           timestamp: u.timestamp ? new Date(u.timestamp) : now,
         };
       } else if (!isOnline) {
@@ -352,7 +381,7 @@ exports.batchUpdate = async (req, res) => {
 
         if (global.io) {
           global.io.emit('vehicle_movement', buildSocketPayload(vehicle));
-          global.io.emit('vehicleMovement',  buildSocketPayload(vehicle));
+          global.io.emit('vehicleMovement', buildSocketPayload(vehicle));
         }
       }
     }
@@ -375,7 +404,7 @@ exports.getVehicleHistory = async (req, res) => {
     if (start || end) {
       query.timestamp = {};
       if (start) query.timestamp.$gte = new Date(start);
-      if (end)   query.timestamp.$lte = new Date(end);
+      if (end) query.timestamp.$lte = new Date(end);
     }
 
     // Try RawGpsLog first (richer data), fallback to LocationPing
@@ -387,7 +416,7 @@ exports.getVehicleHistory = async (req, res) => {
       if (start || end) {
         rawQuery.gpsTimestamp = {};
         if (start) rawQuery.gpsTimestamp.$gte = new Date(start);
-        if (end)   rawQuery.gpsTimestamp.$lte = new Date(end);
+        if (end) rawQuery.gpsTimestamp.$lte = new Date(end);
       }
       history = await RawGpsLog.find(rawQuery)
         .sort({ gpsTimestamp: 1 })
@@ -396,19 +425,19 @@ exports.getVehicleHistory = async (req, res) => {
         .lean();
 
       history = history.map(p => ({
-        lat:       p.latitude,
-        lng:       p.longitude,
-        latitude:  p.latitude,
+        lat: p.latitude,
+        lng: p.longitude,
+        latitude: p.latitude,
         longitude: p.longitude,
-        speed:     p.speed,
-        heading:   p.heading,
-        ignition:  p.ignition,
-        status:    p.status,
+        speed: p.speed,
+        heading: p.heading,
+        ignition: p.ignition,
+        status: p.status,
         timestamp: p.gpsTimestamp,
         deviceTime: p.gpsTimestamp,
-        gpsTime:   p.gpsTimestamp,
-        source:    p.source,
-        voltage:   p.voltage,
+        gpsTime: p.gpsTimestamp,
+        source: p.source,
+        voltage: p.voltage,
       }));
     } else {
       history = await LocationPing.find(query)

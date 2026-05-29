@@ -1,29 +1,29 @@
 'use strict';
 
 const Geofence = require('../models/Geofence');
-const Vehicle  = require('../models/Vehicle');
-const Alert    = require('../models/Alert');
-const logger   = require('../utils/logger');
+const Vehicle = require('../models/Vehicle');
+const Alert = require('../models/Alert');
+const logger = require('../utils/logger');
 
 // ── Haversine distance (metres) ───────────────────────────────────────────────
 function distanceMetres(lat1, lng1, lat2, lng2) {
-  const R  = 6371000;
+  const R = 6371000;
   const φ1 = lat1 * Math.PI / 180;
   const φ2 = lat2 * Math.PI / 180;
   const Δφ = (lat2 - lat1) * Math.PI / 180;
   const Δλ = (lng2 - lng1) * Math.PI / 180;
-  const a  = Math.sin(Δφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
-let _cache      = [];
+let _cache = [];
 let _cacheValid = false;
 
 async function getActiveGeofences() {
   if (_cacheValid) return _cache;
   try {
-    _cache      = await Geofence.find({ isActive: true, status: { $ne: 'inactive' } }).lean();
+    _cache = await Geofence.find({ isActive: true, status: { $ne: 'inactive' } }).lean();
     _cacheValid = true;
     return _cache;
   } catch (err) {
@@ -59,21 +59,21 @@ exports.getGeofences = async (req, res) => {
 
     // Normalise for Flutter GeofenceModel
     const data = fences.map(f => ({
-      id:          f._id.toString(),
-      name:        f.name,
+      id: f._id.toString(),
+      name: f.name,
       description: f.description ?? '',
-      vehicleId:   f.vehicleId   ?? 'all',
-      latitude:    f.latitude,
-      longitude:   f.longitude,
-      radius:      f.radius      ?? 500,
-      status:      f.status      ?? 'active',
-      alertType:   f.alertType   ?? 'both',
-      color:       f.color       ?? '#4f8ef7',
-      isActive:    f.isActive    ?? true,
-      notifyPush:  f.notifyPush  ?? true,
+      vehicleId: f.vehicleId ?? 'all',
+      latitude: f.latitude,
+      longitude: f.longitude,
+      radius: f.radius ?? 500,
+      status: f.status ?? 'active',
+      alertType: f.alertType ?? 'both',
+      color: f.color ?? '#4f8ef7',
+      isActive: f.isActive ?? true,
+      notifyPush: f.notifyPush ?? true,
       triggeredAt: f.triggeredAt ?? null,
-      createdAt:   f.createdAt,
-      updatedAt:   f.updatedAt,
+      createdAt: f.createdAt,
+      updatedAt: f.updatedAt,
     }));
 
     res.json({ success: true, count: data.length, data });
@@ -114,18 +114,18 @@ exports.createGeofence = async (req, res) => {
     const fence = await Geofence.create({
       name,
       description: description ?? '',
-      vehicleId:   vehicleId   ?? 'all',
-      userId:      userId      ?? req.user?._id,
-      latitude:    parseFloat(latitude),
-      longitude:   parseFloat(longitude),
-      radius:      parseFloat(radius ?? 500),
-      alertType:   alertType   ?? 'both',
-      color:       color       ?? '#4f8ef7',
-      notifyPush:  notifyPush  ?? true,
+      vehicleId: vehicleId ?? 'all',
+      userId: userId ?? req.user?._id,
+      latitude: parseFloat(latitude),
+      longitude: parseFloat(longitude),
+      radius: parseFloat(radius ?? 500),
+      alertType: alertType ?? 'both',
+      color: color ?? '#4f8ef7',
+      notifyPush: notifyPush ?? true,
       notifyEmail: notifyEmail ?? false,
-      notifySms:   notifySms   ?? false,
-      status:      'active',
-      isActive:    true,
+      notifySms: notifySms ?? false,
+      status: 'active',
+      isActive: true,
     });
 
     invalidateCache();
@@ -186,7 +186,7 @@ exports.toggleGeofenceActive = async (req, res) => {
     if (!fence) return res.status(404).json({ success: false, message: 'Geofence not found' });
 
     fence.isActive = !fence.isActive;
-    fence.status   = fence.isActive ? 'active' : 'inactive';
+    fence.status = fence.isActive ? 'active' : 'inactive';
     await fence.save();
     invalidateCache();
 
@@ -205,8 +205,8 @@ exports.updateGeofenceStatus = async (req, res) => {
     const { status } = req.body;
     const update = { status };
     if (status === 'triggered') update.triggeredAt = new Date();
-    if (status === 'inactive')  update.isActive = false;
-    if (status === 'active')    update.isActive = true;
+    if (status === 'inactive') update.isActive = false;
+    if (status === 'active') update.isActive = true;
 
     const fence = await Geofence.findByIdAndUpdate(req.params.id, update, { new: true }).lean();
     if (!fence) return res.status(404).json({ success: false, message: 'Geofence not found' });
@@ -246,20 +246,20 @@ exports.checkGeofences = async (vehicle) => {
     const geofences = await getActiveGeofences();
     if (!geofences.length) return;
 
-    const prevFences    = (vehicle.insideGeofences || []).map(id => id.toString());
+    const prevFences = (vehicle.insideGeofences || []).map(id => id.toString());
     const currentFences = [];
 
     for (const fence of geofences) {
       // Skip if fence is assigned to a specific vehicle that isn't this one
       if (fence.vehicleId && fence.vehicleId !== 'all') {
         const fenceVid = fence.vehicleId.toString();
-        const vid      = vehicle._id.toString();
+        const vid = vehicle._id.toString();
         if (fenceVid !== vid) continue;
       }
 
-      const inside     = isInside(vehicle.latitude, vehicle.longitude, fence);
+      const inside = isInside(vehicle.latitude, vehicle.longitude, fence);
       const fenceIdStr = fence._id.toString();
-      const wasInside  = prevFences.includes(fenceIdStr);
+      const wasInside = prevFences.includes(fenceIdStr);
 
       if (inside) currentFences.push(fenceIdStr);
 
@@ -303,24 +303,24 @@ async function _createGeofenceAlert(vehicle, fence, alertType) {
     const isEnter = alertType === 'geofenceEnter';
 
     const alert = await Alert.create({
-      vehicleId:  vehicle._id,
-      imei:       vehicle.imei,
+      vehicleId: vehicle._id,
+      imei: vehicle.imei,
       vehicleReg: vehicle.vehicleReg,
-      type:       alertType,
-      title:      isEnter ? `📍 Entered: ${fence.name}` : `🚧 Exited: ${fence.name}`,
-      message:    `${vehicle.name || vehicle.imei} has ${isEnter ? 'entered' : 'exited'} "${fence.name}"`,
-      priority:   'high',
-      latitude:   vehicle.latitude,
-      longitude:  vehicle.longitude,
-      speed:      vehicle.speed,
-      meta:       { geofenceId: fence._id.toString(), geofenceName: fence.name },
-      timestamp:  new Date(),
+      type: alertType,
+      title: isEnter ? `📍 Entered: ${fence.name}` : `🚧 Exited: ${fence.name}`,
+      message: `${vehicle.name || vehicle.imei} has ${isEnter ? 'entered' : 'exited'} "${fence.name}"`,
+      priority: 'high',
+      latitude: vehicle.latitude,
+      longitude: vehicle.longitude,
+      speed: vehicle.speed,
+      meta: { geofenceId: fence._id.toString(), geofenceName: fence.name },
+      timestamp: new Date(),
     });
 
     // Mark geofence as triggered on entry
     if (isEnter) {
       await Geofence.findByIdAndUpdate(fence._id, {
-        status:      'triggered',
+        status: 'triggered',
         triggeredAt: new Date(),
       });
       invalidateCache();

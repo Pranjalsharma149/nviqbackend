@@ -19,10 +19,10 @@
 
 const cron = require('node-cron');
 
-const Vehicle      = require('../models/Vehicle');
+const Vehicle = require('../models/Vehicle');
 const DailySummary = require('../models/DailySummary');
-const Trip         = require('../models/Trip');
-const logger       = require('../utils/logger');
+const Trip = require('../models/Trip');
+const logger = require('../utils/logger');
 
 const {
   computeDailyFromRaw,
@@ -38,7 +38,7 @@ const {
  */
 async function runForDate(dateInput) {
   const from = utcDayStart(dateInput);
-  const to   = utcDayEnd(dateInput);
+  const to = utcDayEnd(dateInput);
   const dateStr = from.toISOString().split('T')[0];
 
   logger.info('📊 [DailySummaryJob] Starting for date=%s', dateStr);
@@ -54,8 +54,8 @@ async function runForDate(dateInput) {
   logger.info('📊 [DailySummaryJob] Processing %d vehicles', vehicles.length);
 
   let successCount = 0;
-  let skipCount    = 0;
-  let errorCount   = 0;
+  let skipCount = 0;
+  let errorCount = 0;
 
   // Process in batches to avoid OOM
   const BATCH = 20;
@@ -75,9 +75,9 @@ async function runForDate(dateInput) {
 
           // Trip count for the day
           const tripCount = await Trip.countDocuments({
-            vehicleId:   v._id,
+            vehicleId: v._id,
             isCompleted: true,
-            startTime:   { $gte: from, $lte: to },
+            startTime: { $gte: from, $lte: to },
           });
 
           // Upsert — replaces any previous run for this vehicle+date
@@ -85,22 +85,22 @@ async function runForDate(dateInput) {
             { vehicleId: v._id, date: from },
             {
               $set: {
-                vehicleId:       v._id,
-                imei:            v.imei,
-                date:            from,
-                totalDistance:   stats.totalDistance,
+                vehicleId: v._id,
+                imei: v.imei,
+                date: from,
+                totalDistance: stats.totalDistance,
                 engineOnSeconds: stats.engineOnSeconds,
-                runningSeconds:  stats.runningSeconds,
-                idleSeconds:     stats.idleSeconds,
-                engineHours:     stats.engineHours,
-                runningHours:    stats.runningHours,
-                idleHours:       stats.idleHours,
-                maxSpeed:        stats.maxSpeed,
-                avgSpeed:        stats.avgSpeed,
+                runningSeconds: stats.runningSeconds,
+                idleSeconds: stats.idleSeconds,
+                engineHours: stats.engineHours,
+                runningHours: stats.runningHours,
+                idleHours: stats.idleHours,
+                maxSpeed: stats.maxSpeed,
+                avgSpeed: stats.avgSpeed,
                 tripCount,
-                rawPointCount:   stats.rawPointCount,
-                generatedAt:     new Date(),
-                isPartial:       false,
+                rawPointCount: stats.rawPointCount,
+                generatedAt: new Date(),
+                isPartial: false,
               },
             },
             { upsert: true, new: true }
@@ -155,6 +155,27 @@ async function backfill(days = 30) {
   logger.info('✅ [DailySummaryJob] Backfill complete');
 }
 
+
+// ── resetTodayStops ───────────────────────────────────────────────────────────
+async function resetTodayStops() {
+  try {
+    const result = await Vehicle.updateMany(
+      {},
+      {
+        $set: {
+          todayStops: 0,
+          todayStopResetAt: new Date(),
+        },
+      }
+    );
+    logger.info('🔄 [DailySummaryJob] todayStops reset for %d vehicles', result.modifiedCount);
+  } catch (err) {
+    logger.error('❌ [DailySummaryJob] todayStops reset failed: %s', err.message);
+  }
+}
+
+
+
 // ── archiveOldRawLogs ─────────────────────────────────────────────────────────
 /**
  * Optional: delete RawGpsLog entries older than ARCHIVE_DAYS.
@@ -164,9 +185,9 @@ async function backfill(days = 30) {
 async function archiveOldRawLogs() {
   if (process.env.ARCHIVE_RAW_LOGS !== 'true') return;
 
-  const RawGpsLog   = require('../models/RawGpsLog');
+  const RawGpsLog = require('../models/RawGpsLog');
   const archiveDays = parseInt(process.env.ARCHIVE_RAW_DAYS ?? '90', 10);
-  const cutoff      = new Date(Date.now() - archiveDays * 24 * 60 * 60 * 1000);
+  const cutoff = new Date(Date.now() - archiveDays * 24 * 60 * 60 * 1000);
 
   logger.info(
     '🗑️  [DailySummaryJob] Archiving raw logs older than %s',
@@ -195,13 +216,14 @@ function start() {
     logger.info('⏰ [DailySummaryJob] Cron triggered');
     try {
       await runYesterday();
+      await resetTodayStops(); // for reset daily stops basically it is there only temp for day only
       await archiveOldRawLogs();
     } catch (err) {
       logger.error('❌ [DailySummaryJob] Cron run failed: %s', err.message);
     }
   }, {
     scheduled: true,
-    timezone:  'UTC',
+    timezone: 'UTC',
   });
 
   logger.info('⏰ [DailySummaryJob] Scheduled (daily at 00:05 UTC)');
