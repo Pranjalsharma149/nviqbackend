@@ -350,7 +350,9 @@ class AnalyticsService {
    */
   static async getDailyAnalytics(vehicleId, date) {
     const from = utcDayStart(date);
+
     const to = utcDayEnd(date);
+
     const vId = new mongoose.Types.ObjectId(vehicleId);
 
     if (!isToday(date)) {

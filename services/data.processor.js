@@ -786,6 +786,11 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       $max: { todayMaxSpeed: dev.speed },
     };
 
+    // Increment today's stops count if vehicle transitions out of moving state
+    if (vehicle.status === 'moving' && status !== 'moving') {
+      updateOp.$inc = { todayStops: 1 };
+    }
+
     // FIX-ODO: only overwrite odometer if device sends a valid, larger value
     if (dev.odometer != null && dev.odometer > 0) {
       updateOp.$max.odometer = dev.odometer;

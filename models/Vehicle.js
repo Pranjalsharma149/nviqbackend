@@ -286,6 +286,37 @@ const vehicleSchema = new mongoose.Schema(
       comment: 'Device internal temperature',
     },
 
+    todayDistance: {
+      type: Number,
+      default: 0,
+      comment: 'Today distance traveled in km',
+    },
+
+    todayEngineHours: {
+      type: Number,
+      default: 0,
+      comment: 'Today engine hours',
+    },
+
+    todayMaxSpeed: {
+      type: Number,
+      default: 0,
+      comment: 'Today maximum speed in km/h',
+    },
+
+    odometer: {
+      type: Number,
+      default: 0,
+      comment: 'Vehicle odometer reading in km',
+    },
+
+    vehicleReg: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      comment: 'Vehicle registration number alias/variant',
+    },
+
     // ── TIMESTAMPS ─────────────────────────────────────────────────────────
     lastUpdate: {
       type: Date,
@@ -324,6 +355,7 @@ vehicleSchema.index({ phone: 1, createdAt: -1 });
 // IMEI queries (find vehicle by device)
 vehicleSchema.index({ imei: 1 });
 vehicleSchema.index({ registrationNumber: 1 });
+vehicleSchema.index({ vehicleReg: 1 }); // Index for vehicleReg queries
 
 // Real-time tracking
 vehicleSchema.index({ isOnline: 1, lastUpdate: -1 });
@@ -332,6 +364,11 @@ vehicleSchema.index({ latitude: 1, longitude: 1 });
 // ── PRE-SAVE MIDDLEWARE ────────────────────────────────────────────────────────
 vehicleSchema.pre('save', function (next) {
   this.updatedAt = new Date();
+  if (this.registrationNumber) {
+    this.vehicleReg = this.registrationNumber.toUpperCase();
+  } else if (this.vehicleReg) {
+    this.registrationNumber = this.vehicleReg.toUpperCase();
+  }
   next();
 });
 
