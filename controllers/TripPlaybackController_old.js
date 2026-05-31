@@ -3,45 +3,68 @@
 /**
  * TripPlaybackController
  *
- * FIXES applied:
- *  FIX-A  tripSummary returns todayDistanceKm, totalDistanceKm, engineHours
- *  FIX-B  gpsRecords time-range filter uses gpsTime
- *  FIX-C  tripDates aggregation groups on gpsTime
- *  FIX-D  playbackData + tripPoints sort/filter on gpsTime
- *  FIX-E  tripEvents derives overspeed events from LocationPing
- *  FIX-F  ALL endpoints now read lat/lng/course/acc (Wanway field names)
- *         instead of latitude/longitude/heading/ignitionOn
- *         Also handles gpsTime as epoch seconds (Wanway format)
+ * FIXES applied vs previous version:
+ *
+ *  FIX-A  tripSummary now returns todayDistanceKm, totalDistanceKm, engineHours
+ *         so Flutter's fetchMileageReport() gets the fields it reads via
+ *         report.todayDistanceKm / report.totalDistanceKm / report.engineHours.
+ *         Values are aggregated from LocationPing records for the requested day.
+ *
+ *  FIX-B  gpsRecords time-range filter uses gpsTime (matches LocationPing
+ *         schema field) not timestamp.
+ *
+ *  FIX-C  tripDates aggregation groups on gpsTime, not timestamp.
+ *
+ *  FIX-D  playbackData + tripPoints both sort / filter on gpsTime.
+ *
+ *  FIX-E  tripEvents stub derives overspeed events from LocationPing so it
+ *         works without a separate Event model.
+ *
+ * LocationPing schema fields expected (models/LocationPing.js):
+ *   vehicleId, imei, latitude, longitude, speed, heading, altitude,
+ *   accuracy, satellites, batteryVoltage, ignitionOn,
+ *   gpsTime (Date, indexed),  deviceTime (Date),
+ *   address, serverOdometerKm, todayDistance, engineHours, source
  */
 
-const Trip = require('../models/Trip');
+const Trip         = require('../models/Trip');
 const LocationPing = require('../models/LocationPing');
 
 const TAG = '[TripPlaybackCtrl]';
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Post-turn zig-zag outlier filter ─────────────────────────────────────────
+// Removes GPS drift artefacts by checking whether visiting a point creates a
+// detour more than 2.5× the direct distance between its neighbors. Points that
+// pass the quality/bearing checks in data.processor may still form a small kink
+// on screen — this removes the last visible residue.
 
 function _distKm(lat1, lng1, lat2, lng2) {
-  const R = 6371;
+  const R    = 6371;
   const dLat = (lat2 - lat1) * Math.PI / 180;
   const dLon = (lng2 - lng1) * Math.PI / 180;
-  const a = Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-    Math.sin(dLon / 2) ** 2;
+  const a    = Math.sin(dLat / 2) ** 2 +
+               Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+               Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 function _filterZigZag(points) {
   if (points.length < 3) return points;
+
   const out = [points[0]];
   for (let i = 1; i < points.length - 1; i++) {
     const prev = out[out.length - 1];
     const curr = points[i];
     const next = points[i + 1];
+
     const dPC = _distKm(prev.lat, prev.lng, curr.lat, curr.lng);
     const dCN = _distKm(curr.lat, curr.lng, next.lat, next.lng);
     const dPN = _distKm(prev.lat, prev.lng, next.lat, next.lng);
+
+    // Skip point if it creates a detour > 2.5× the direct prev→next path.
+    // Minimum direct distance of 5 m prevents false positives on slow/stopped vehicles.
     if (dPN > 0.005 && (dPC + dCN) > dPN * 2.5) continue;
+
     out.push(curr);
   }
   out.push(points[points.length - 1]);
@@ -65,75 +88,8 @@ function serverError(res, err) {
   return res.status(500).json({ code: 2, message: 'Server error', error: err.message });
 }
 
-// ── FIX-F: Normalize a LocationPing to Flutter-friendly format ────────────────
-// Wanway saves: lat, lng, course, acc, gpsTime (epoch seconds)
-// Flutter reads: lat, lng, heading, ignitionOn, gpsTime (ISO string)
-function normalizePing(p) {
-  // Coordinates — check both Wanway (lat/lng) and standard (latitude/longitude)
-  const lat = p.lat ?? p.latitude ?? null;
-  const lng = p.lng ?? p.longitude ?? null;
-
-  // Heading — Wanway uses 'course', fallback to 'heading'
-  const heading = p.course ?? p.heading ?? 0;
-
-  // Ignition — Wanway uses 'acc', fallback to 'ignitionOn'
-  const ignitionOn = p.acc ?? p.ignitionOn ?? false;
-
-  // Satellites — Wanway uses 'gpsNum' or 'satellites'
-  const satellites = p.satellites ?? p.gpsNum ?? p.satelliteNum ?? 0;
-
-  // Voltage — Wanway extVoltage is in tenths of a volt
-  let voltage = null;
-  if (p.extVoltage != null) {
-    voltage = p.extVoltage > 100 ? p.extVoltage / 10 : p.extVoltage;
-  } else if (p.voltage != null) {
-    voltage = Number(p.voltage);
-  }
-
-  // gpsTime — Wanway sends epoch in SECONDS, convert to ISO string
-  let gpsTimeISO = null;
-  if (p.gpsTime instanceof Date) {
-    gpsTimeISO = p.gpsTime.toISOString();
-  } else if (typeof p.gpsTime === 'number') {
-    // epoch seconds → milliseconds
-    gpsTimeISO = new Date(p.gpsTime * 1000).toISOString();
-  } else if (typeof p.gpsTime === 'string') {
-    gpsTimeISO = p.gpsTime;
-  }
-
-  // deviceTime fallback
-  let deviceTimeISO = null;
-  if (p.deviceTime instanceof Date) {
-    deviceTimeISO = p.deviceTime.toISOString();
-  } else if (p.deviceTime) {
-    deviceTimeISO = String(p.deviceTime);
-  }
-
-  return {
-    id: p._id?.toString(),
-    // Both field name styles so Flutter finds them either way
-    lat,
-    lng,
-    latitude: lat,
-    longitude: lng,
-    speed: p.speed ?? 0,
-    heading,
-    course: heading,
-    altitude: p.altitude ?? 0,
-    accuracy: p.accuracy ?? p.hdop ?? 0,
-    satellites,
-    ignitionOn,
-    acc: ignitionOn,
-    batteryVoltage: voltage,
-    // Both time field names Flutter checks
-    gpsTime: gpsTimeISO,
-    timestamp: gpsTimeISO ?? deviceTimeISO,
-    deviceTime: deviceTimeISO ?? gpsTimeISO,
-    address: p.address ?? null,
-  };
-}
-
 // ── GET /api/trips/points ─────────────────────────────────────────────────────
+// Flutter: fetchTripHistory(vehicleId, date) → needs lat, lng, speed, heading, timestamp
 exports.tripPoints = async (req, res) => {
   try {
     const { vehicleId, date } = req.query;
@@ -151,7 +107,23 @@ exports.tripPoints = async (req, res) => {
       return res.json({ code: 0, data: [], message: 'No trip data for this date' });
     }
 
-    const raw = pings.map(normalizePing);
+    const raw = pings.map(p => ({
+      id:          p._id?.toString(),
+      lat:         p.latitude,
+      lng:         p.longitude,
+      latitude:    p.latitude,
+      longitude:   p.longitude,
+      speed:       p.speed       ?? 0,
+      heading:     p.heading     ?? 0,
+      altitude:    p.altitude    ?? 0,
+      accuracy:    p.accuracy    ?? 0,
+      satellites:  p.satellites  ?? 0,
+      ignitionOn:  p.ignitionOn  ?? false,
+      timestamp:   p.gpsTime.toISOString(),
+      deviceTime:  p.deviceTime?.toISOString() ?? p.gpsTime.toISOString(),
+      address:     p.address     ?? null,
+    }));
+
     const points = _filterZigZag(raw);
 
     console.log(`${TAG} tripPoints: ${points.length}/${raw.length} pts for ${vehicleId} on ${date}`);
@@ -159,10 +131,10 @@ exports.tripPoints = async (req, res) => {
       code: 0,
       data: points,
       metadata: {
-        count: points.length,
+        count:        points.length,
         originalCount: raw.length,
-        startTime: points[0].gpsTime,
-        endTime: points[points.length - 1].gpsTime,
+        startTime:    points[0].timestamp,
+        endTime:      points[points.length - 1].timestamp,
       },
     });
   } catch (err) {
@@ -171,6 +143,7 @@ exports.tripPoints = async (req, res) => {
 };
 
 // ── GET /api/trips/playback ───────────────────────────────────────────────────
+// Sampled subset for smooth animation. interval= seconds between sampled points.
 exports.playbackData = async (req, res) => {
   try {
     const { vehicleId, date, interval = 5 } = req.query;
@@ -190,15 +163,21 @@ exports.playbackData = async (req, res) => {
     const rawSampled = [];
     let lastMs = null;
     for (const p of all) {
-      // handle both Date object and epoch seconds
-      const ms = p.gpsTime instanceof Date
-        ? p.gpsTime.getTime()
-        : typeof p.gpsTime === 'number'
-          ? p.gpsTime * 1000
-          : new Date(p.gpsTime).getTime();
-
+      const ms = p.gpsTime.getTime();
       if (lastMs === null || (ms - lastMs) / 1000 >= stepSec) {
-        rawSampled.push(normalizePing(p));
+        rawSampled.push({
+          id:        p._id?.toString(),
+          lat:       p.latitude,
+          lng:       p.longitude,
+          latitude:  p.latitude,
+          longitude: p.longitude,
+          speed:     p.speed    ?? 0,
+          heading:   p.heading  ?? 0,
+          altitude:  p.altitude ?? 0,
+          satellites: p.satellites ?? 0,
+          ignitionOn: p.ignitionOn ?? false,
+          timestamp: p.gpsTime.toISOString(),
+        });
         lastMs = ms;
       }
     }
@@ -210,8 +189,8 @@ exports.playbackData = async (req, res) => {
       code: 0,
       data: sampled,
       metadata: {
-        originalCount: all.length,
-        sampledCount: sampled.length,
+        originalCount:    all.length,
+        sampledCount:     sampled.length,
         samplingInterval: stepSec,
       },
     });
@@ -221,6 +200,14 @@ exports.playbackData = async (req, res) => {
 };
 
 // ── GET /api/trips/summary ────────────────────────────────────────────────────
+// FIX-A: Flutter's _fetchWanwayDataForVehicle reads:
+//   report.todayDistanceKm, report.dailyDistance, report.distanceToday
+//   report.totalDistanceKm, report.odometer, report.odometerKm
+//   report.engineHours, report.totalEngineHours, report.runningHours
+//
+// These fields do NOT exist on the Trip model, so we aggregate from LocationPing.
+// The last ping of the day carries the running daily totals persisted by
+// PersistentSyncService.recordGPSFixWithOdometer().
 exports.tripSummary = async (req, res) => {
   try {
     const { vehicleId, date } = req.query;
@@ -230,59 +217,74 @@ exports.tripSummary = async (req, res) => {
 
     const [agg] = await LocationPing.aggregate([
       { $match: { vehicleId, gpsTime: { $gte: start, $lte: end } } },
-      { $sort: { gpsTime: 1 } },
+      { $sort:  { gpsTime: 1 } },
       {
         $group: {
-          _id: '$vehicleId',
-          pingCount: { $sum: 1 },
-          maxSpeed: { $max: '$speed' },
-          avgSpeed: { $avg: '$speed' },
+          _id:             '$vehicleId',
+          pingCount:       { $sum: 1 },
+          maxSpeed:        { $max: '$speed' },
+          avgSpeed:        { $avg: '$speed' },
+          // Last ping has the most current running totals
           todayDistanceKm: { $last: '$todayDistance' },
           totalDistanceKm: { $last: '$serverOdometerKm' },
-          engineHours: { $last: '$engineHours' },
-          firstPing: { $first: '$gpsTime' },
-          lastPing: { $last: '$gpsTime' },
+          engineHours:     { $last: '$engineHours' },
+          firstPing:       { $first: '$gpsTime' },
+          lastPing:        { $last:  '$gpsTime' },
         },
       },
     ]);
 
+    // Also pull the Trip doc if one exists (provides duration, alertCount, etc.)
     const trip = await Trip.findOne({
       vehicleId,
       startTime: { $gte: start, $lte: end },
     }).sort({ startTime: -1 }).lean();
 
-    const todayKm = agg?.todayDistanceKm ?? trip?.totalDistance ?? 0;
-    const totalKm = agg?.totalDistanceKm ?? 0;
-    const engineHrs = agg?.engineHours ?? 0;
-    const maxSpd = Math.max(agg?.maxSpeed ?? 0, trip?.maxSpeed ?? 0);
-    const avgSpd = agg?.avgSpeed ?? trip?.avgSpeed ?? 0;
+    const todayKm   = agg?.todayDistanceKm ?? trip?.totalDistance ?? 0;
+    const totalKm   = agg?.totalDistanceKm ?? 0;
+    const engineHrs = agg?.engineHours     ?? 0;
+    const maxSpd    = Math.max(agg?.maxSpeed ?? 0, trip?.maxSpeed ?? 0);
+    const avgSpd    = agg?.avgSpeed ?? trip?.avgSpeed ?? 0;
 
     const fmt1 = n => Number((n ?? 0).toFixed(1));
     const fmt2 = n => Number((n ?? 0).toFixed(2));
 
+    console.log(`${TAG} tripSummary: ${vehicleId} ${date} — today=${fmt2(todayKm)}km total=${fmt2(totalKm)}km eng=${fmt2(engineHrs)}h`);
+
     return res.json({
       code: 0,
       data: {
-        vehicleId, date,
-        todayDistanceKm: fmt2(todayKm),
-        totalDistanceKm: fmt2(totalKm),
-        engineHours: fmt2(engineHrs),
-        dailyDistance: fmt2(todayKm),
-        distanceToday: fmt2(todayKm),
-        odometer: fmt2(totalKm),
-        odometerKm: fmt2(totalKm),
+        vehicleId,
+        date,
+
+        // Primary field names Flutter reads (live_tracking_screen.dart FIX-1,2,4)
+        todayDistanceKm:  fmt2(todayKm),
+        totalDistanceKm:  fmt2(totalKm),
+        engineHours:      fmt2(engineHrs),
+
+        // Fallback aliases checked by Flutter code
+        dailyDistance:    fmt2(todayKm),
+        distanceToday:    fmt2(todayKm),
+        odometer:         fmt2(totalKm),
+        odometerKm:       fmt2(totalKm),
         totalEngineHours: fmt2(engineHrs),
-        runningHours: fmt2(engineHrs),
-        maxSpeed: fmt1(maxSpd),
-        avgSpeed: fmt1(avgSpd),
+        runningHours:     fmt2(engineHrs),
+
+        // Speed stats
+        maxSpeed:  fmt1(maxSpd),
+        avgSpeed:  fmt1(avgSpd),
+
+        // Ping metadata
         pingCount: agg?.pingCount ?? 0,
         firstPing: agg?.firstPing ?? null,
-        lastPing: agg?.lastPing ?? null,
-        tripId: trip?._id?.toString() ?? null,
-        duration: trip?.duration ?? null,
-        idleTime: trip?.idleTime ?? null,
-        alertCount: trip?.alertCount ?? null,
-        isCompleted: trip?.isCompleted ?? false,
+        lastPing:  agg?.lastPing  ?? null,
+
+        // Trip record extras
+        tripId:      trip?._id?.toString() ?? null,
+        duration:    trip?.duration        ?? null,
+        idleTime:    trip?.idleTime        ?? null,
+        alertCount:  trip?.alertCount      ?? null,
+        isCompleted: trip?.isCompleted     ?? false,
       },
     });
   } catch (err) {
@@ -291,6 +293,7 @@ exports.tripSummary = async (req, res) => {
 };
 
 // ── GET /api/trips/dates ──────────────────────────────────────────────────────
+// FIX-C: groups on gpsTime (correct field name)
 exports.tripDates = async (req, res) => {
   try {
     const { vehicleId, year, month } = req.query;
@@ -301,7 +304,7 @@ exports.tripDates = async (req, res) => {
     const y = parseInt(year);
     const m = parseInt(month);
     const startOfMonth = new Date(y, m - 1, 1);
-    const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
+    const endOfMonth   = new Date(y, m,     0, 23, 59, 59, 999);
 
     const rows = await LocationPing.aggregate([
       {
@@ -312,7 +315,7 @@ exports.tripDates = async (req, res) => {
       },
       {
         $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$gpsTime' } },
+          _id:   { $dateToString: { format: '%Y-%m-%d', date: '$gpsTime' } },
           count: { $sum: 1 },
         },
       },
@@ -320,6 +323,7 @@ exports.tripDates = async (req, res) => {
     ]);
 
     const dates = rows.map(r => ({ date: r._id, count: r.count }));
+    console.log(`${TAG} tripDates: ${dates.length} active days for ${vehicleId} ${y}-${m}`);
     return res.json({ code: 0, data: dates });
   } catch (err) {
     return serverError(res, err);
@@ -327,6 +331,8 @@ exports.tripDates = async (req, res) => {
 };
 
 // ── GET /api/trips/events ─────────────────────────────────────────────────────
+// FIX-E: derives overspeed events from LocationPing — no separate model needed.
+// Extend with harsh braking / other types when you add an Event collection.
 exports.tripEvents = async (req, res) => {
   try {
     const { vehicleId, date, type } = req.query;
@@ -336,6 +342,7 @@ exports.tripEvents = async (req, res) => {
     const OVERSPEED_KMH = 80;
 
     if (type && type !== 'overspeed') {
+      // Unknown type — return empty until a dedicated Event model exists
       return res.json({ code: 0, data: [] });
     }
 
@@ -343,26 +350,24 @@ exports.tripEvents = async (req, res) => {
       .find({
         vehicleId,
         gpsTime: { $gte: start, $lte: end },
-        speed: { $gt: OVERSPEED_KMH },
+        speed:   { $gt: OVERSPEED_KMH },
       })
       .sort({ gpsTime: 1 })
       .limit(500)
       .lean();
 
-    const events = pings.map(p => {
-      const n = normalizePing(p);
-      return {
-        type: 'overspeed',
-        lat: n.lat,
-        lng: n.lng,
-        latitude: n.lat,
-        longitude: n.lng,
-        speed: n.speed,
-        threshold: OVERSPEED_KMH,
-        timestamp: n.gpsTime,
-      };
-    });
+    const events = pings.map(p => ({
+      type:      'overspeed',
+      lat:       p.latitude,
+      lng:       p.longitude,
+      latitude:  p.latitude,
+      longitude: p.longitude,
+      speed:     p.speed,
+      threshold: OVERSPEED_KMH,
+      timestamp: p.gpsTime.toISOString(),
+    }));
 
+    console.log(`${TAG} tripEvents: ${events.length} overspeed events for ${vehicleId} on ${date}`);
     return res.json({ code: 0, data: events });
   } catch (err) {
     return serverError(res, err);
@@ -370,6 +375,7 @@ exports.tripEvents = async (req, res) => {
 };
 
 // ── GET /api/trips/gps/records ────────────────────────────────────────────────
+// FIX-B: time-range filter uses gpsTime, not timestamp
 exports.gpsRecords = async (req, res) => {
   try {
     const { vehicleId, imei, startTime, endTime } = req.query;
@@ -377,7 +383,7 @@ exports.gpsRecords = async (req, res) => {
 
     const query = {};
     if (vehicleId) query.vehicleId = vehicleId;
-    else query.imei = imei;
+    else           query.imei      = imei;
 
     if (startTime && endTime) {
       query.gpsTime = {
@@ -392,37 +398,8 @@ exports.gpsRecords = async (req, res) => {
       .limit(10000)
       .lean();
 
-    const normalized = records.map(normalizePing);
-
-    return res.json({ code: 0, data: normalized, count: normalized.length });
-  } catch (err) {
-    return serverError(res, err);
-  }
-};
-
-// ── GET /api/trips/points/range ───────────────────────────────────────────────
-exports.tripPointsRange = async (req, res) => {
-  try {
-    const { vehicleId, startTime, endTime } = req.query;
-    if (!vehicleId || !startTime || !endTime) {
-      return badRequest(res, 'vehicleId, startTime, endTime required');
-    }
-
-    const pings = await LocationPing
-      .find({
-        vehicleId,
-        gpsTime: { $gte: new Date(startTime), $lte: new Date(endTime) },
-      })
-      .sort({ gpsTime: 1 })
-      .limit(50000)
-      .lean();
-
-    if (!pings.length) return res.json({ code: 0, data: [] });
-
-    const raw = pings.map(normalizePing);
-    const points = _filterZigZag(raw);
-
-    return res.json({ code: 0, data: points });
+    console.log(`${TAG} gpsRecords: ${records.length} records returned`);
+    return res.json({ code: 0, data: records, count: records.length });
   } catch (err) {
     return serverError(res, err);
   }

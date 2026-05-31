@@ -114,6 +114,7 @@ function buildSocketPayload(v) {
     ts: v.lastUpdate,
 
     // Flutter FIX-1: today distance — all aliases
+    todayDistanceKm: v.todayDistance ?? 0,
     todayDistance: v.todayDistance ?? 0,
     todayKm: v.todayDistance ?? 0,
     today_km: v.todayDistance ?? 0,
@@ -124,6 +125,14 @@ function buildSocketPayload(v) {
     mileage: v.odometer ?? 0,
     totalDistance: v.odometer ?? 0,
     totalKm: v.odometer ?? 0,
+
+    // Engine hours aliases
+    engineHoursToday: v.todayEngineHours ?? 0,
+    todayEngineHours: v.todayEngineHours ?? 0,
+    engineHours: v.todayEngineHours ?? 0,
+
+    // Today max speed
+    todayMaxSpeed: v.todayMaxSpeed ?? 0,
 
     // Address
     address: v.address ?? v.lastKnownLocation?.address ?? '',

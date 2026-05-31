@@ -33,6 +33,7 @@
 
 const logger = require('../utils/logger');
 const { haversineKm, isNoisePoint } = require('../utils/distance');
+const { computeDailyFromRaw, utcDayStart, utcDayEnd } = require('./analytics.service');
 
 // ── GCJ-02 → WGS-84 (kept for TCP devices that need it) ──────────────────────
 function gcj02ToWgs84(gcjLng, gcjLat) {
@@ -250,12 +251,16 @@ function _updateStatusSince(imei, currentStatus, ts) {
 // ── Daily distance accumulator ────────────────────────────────────────────────
 const _dailyDist = new Map();
 
-function _getTodayStr() {
-  const now   = new Date();
-  const year  = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const day   = String(now.getDate()).padStart(2, '0');
+function _getDateStr(date) {
+  const d     = new Date(date);
+  const year  = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day   = String(d.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+function _getTodayStr() {
+  return _getDateStr(new Date());
 }
 
 // FIX-IGN-3: ignitionOn now accepts the effective ignition (after inference)
@@ -575,13 +580,64 @@ async function processIncomingData(rawDevice, source = 'wanway') {
 
   // 5. Resolve vehicle
   const vehicle = await Vehicle.findOne({ imei: dev.imei })
-    .select('_id imei lastKnownLocation odometer ignitionOn ignitionSince statusSince status')
+    .select('_id imei lastKnownLocation odometer ignitionOn ignitionSince statusSince status todayDistance todayEngineHours todayMaxSpeed lastUpdate latitude longitude')
     .lean();
   if (!vehicle) {
     logger.warn('⚠️ [Processor] Unknown IMEI=%s — not in DB', dev.imei);
     return;
   }
   const vehicleId = vehicle._id;
+
+  const today = _getTodayStr();
+
+  // Seed daily metrics from RawGpsLog (self-healing) if not in memory
+  if (!_dailyDist.has(dev.imei) || !_engineHours.has(dev.imei)) {
+    try {
+      const todayStart = utcDayStart(now);
+      const todayEnd = utcDayEnd(now);
+      const stats = await computeDailyFromRaw(vehicleId, todayStart, todayEnd);
+
+      _dailyDist.set(dev.imei, {
+        distKm: stats.totalDistance ?? 0,
+        lastLat: lat ?? vehicle.latitude ?? null,
+        lastLng: lng ?? vehicle.longitude ?? null,
+        dateStr: today,
+      });
+
+      _engineHours.set(dev.imei, {
+        hoursToday: stats.engineHours ?? 0,
+        lastTs: gpsTs.getTime(),
+        ignitionOn: effectiveIgnition,
+        dateStr: today,
+      });
+
+      // Update local vehicle cache with self-healed values for this tick's logic
+      vehicle.todayDistance = stats.totalDistance ?? 0;
+      vehicle.todayEngineHours = stats.engineHours ?? 0;
+      vehicle.todayMaxSpeed = stats.maxSpeed ?? 0;
+
+    } catch (err) {
+      logger.error('❌ [Processor] Failed to self-heal metrics for IMEI=%s: %s', dev.imei, err.message);
+
+      // Fallback to DB fields if RawGpsLog computation fails
+      if (!_dailyDist.has(dev.imei)) {
+        _dailyDist.set(dev.imei, {
+          distKm: vehicle.todayDistance ?? 0,
+          lastLat: vehicle.latitude ?? null,
+          lastLng: vehicle.longitude ?? null,
+          dateStr: today,
+        });
+      }
+      if (!_engineHours.has(dev.imei)) {
+        _engineHours.set(dev.imei, {
+          hoursToday: vehicle.todayEngineHours ?? 0,
+          lastTs: vehicle.lastUpdate ? new Date(vehicle.lastUpdate).getTime() : null,
+          ignitionOn: vehicle.ignitionOn ?? false,
+          dateStr: today,
+        });
+      }
+    }
+  }
 
   // Seed ignition state from DB if not already in memory
   if (!_ignitionState.has(dev.imei)) {
@@ -780,19 +836,28 @@ async function processIncomingData(rawDevice, source = 'wanway') {
 
   if (isOnline && hasValidGPS) vehicleUpdate.lastOnlineAt = gpsTs;
 
+  const lastUpdateDateStr = vehicle.lastUpdate ? _getDateStr(vehicle.lastUpdate) : null;
+  const isNewDay = !lastUpdateDateStr || lastUpdateDateStr !== today;
+
   try {
     const updateOp = {
       $set: vehicleUpdate,
-      $max: { todayMaxSpeed: dev.speed },
     };
 
-    // Increment today's stops count if vehicle transitions out of moving state
-    if (vehicle.status === 'moving' && status !== 'moving') {
-      updateOp.$inc = { todayStops: 1 };
+    if (isNewDay) {
+      vehicleUpdate.todayMaxSpeed = dev.speed;
+      vehicleUpdate.todayStops = (vehicle.status === 'moving' && status !== 'moving') ? 1 : 0;
+    } else {
+      updateOp.$max = { todayMaxSpeed: dev.speed };
+      // Increment today's stops count if vehicle transitions out of moving state
+      if (vehicle.status === 'moving' && status !== 'moving') {
+        updateOp.$inc = { todayStops: 1 };
+      }
     }
 
     // FIX-ODO: only overwrite odometer if device sends a valid, larger value
     if (dev.odometer != null && dev.odometer > 0) {
+      if (!updateOp.$max) updateOp.$max = {};
       updateOp.$max.odometer = dev.odometer;
     }
 
@@ -858,11 +923,18 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       timestamp:  now.toISOString(),
 
       // All distance/odometer aliases Flutter checks
+      todayDistanceKm: todayDistKm,
       todayDistance:  todayDistKm,
       todayKm:        todayDistKm,
       today_km:       todayDistKm,
       dailyDistance:  todayDistKm,
+
+      // Engine hours aliases
+      engineHoursToday: engineHrs,
+      todayEngineHours: engineHrs,
       engineHours:    engineHrs,
+
+      todayMaxSpeed:  isNewDay ? dev.speed : Math.max(vehicle.todayMaxSpeed ?? 0, dev.speed),
 
       // Odometer — Flutter reads: mileage, odometer, totalDistance, totalKm
       odometer:      dev.odometer ?? vehicle.odometer ?? 0,
