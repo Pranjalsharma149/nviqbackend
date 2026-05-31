@@ -276,7 +276,7 @@ exports.getLiveVehicles = async (req, res) => {
         todayDistanceKm: v.todayDistance ?? 0,
         todayDistance: v.todayDistance ?? 0,
         // Flutter FIX-4: odometer
-        totalDistanceKm: v.odometer ?? 0,
+        totalDistanceKm: v.todayDistance ?? 0,
         odometer: v.odometer ?? 0,
         // Flutter FIX-2: engine hours
         engineHoursToday: v.todayEngineHours ?? 0,

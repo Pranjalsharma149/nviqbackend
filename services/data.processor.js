@@ -37,30 +37,30 @@ const { computeDailyFromRaw, utcDayStart, utcDayEnd } = require('./analytics.ser
 
 // ── GCJ-02 → WGS-84 (kept for TCP devices that need it) ──────────────────────
 function gcj02ToWgs84(gcjLng, gcjLat) {
-  const a  = 6378245.0;
+  const a = 6378245.0;
   const ee = 0.00669342162296594323;
 
   function transformLat(lng, lat) {
-    let r = -100 + 2*lng + 3*lat + 0.2*lat*lat + 0.1*lng*lat + 0.2*Math.sqrt(Math.abs(lng));
-    r += (20*Math.sin(6*lng*Math.PI) + 20*Math.sin(2*lng*Math.PI)) * 2/3;
-    r += (20*Math.sin(lat*Math.PI)   + 40*Math.sin(lat/3*Math.PI)) * 2/3;
-    r += (160*Math.sin(lat/12*Math.PI) + 320*Math.sin(lat*Math.PI/30)) * 2/3;
+    let r = -100 + 2 * lng + 3 * lat + 0.2 * lat * lat + 0.1 * lng * lat + 0.2 * Math.sqrt(Math.abs(lng));
+    r += (20 * Math.sin(6 * lng * Math.PI) + 20 * Math.sin(2 * lng * Math.PI)) * 2 / 3;
+    r += (20 * Math.sin(lat * Math.PI) + 40 * Math.sin(lat / 3 * Math.PI)) * 2 / 3;
+    r += (160 * Math.sin(lat / 12 * Math.PI) + 320 * Math.sin(lat * Math.PI / 30)) * 2 / 3;
     return r;
   }
 
   function transformLng(lng, lat) {
-    let r = 300 + lng + 2*lat + 0.1*lng*lng + 0.1*lng*lat + 0.1*Math.sqrt(Math.abs(lng));
-    r += (20*Math.sin(6*lng*Math.PI) + 20*Math.sin(2*lng*Math.PI)) * 2/3;
-    r += (20*Math.sin(lng*Math.PI)   + 40*Math.sin(lng/3*Math.PI)) * 2/3;
-    r += (150*Math.sin(lng/12*Math.PI) + 300*Math.sin(lng/30*Math.PI)) * 2/3;
+    let r = 300 + lng + 2 * lat + 0.1 * lng * lng + 0.1 * lng * lat + 0.1 * Math.sqrt(Math.abs(lng));
+    r += (20 * Math.sin(6 * lng * Math.PI) + 20 * Math.sin(2 * lng * Math.PI)) * 2 / 3;
+    r += (20 * Math.sin(lng * Math.PI) + 40 * Math.sin(lng / 3 * Math.PI)) * 2 / 3;
+    r += (150 * Math.sin(lng / 12 * Math.PI) + 300 * Math.sin(lng / 30 * Math.PI)) * 2 / 3;
     return r;
   }
 
-  const dLat      = transformLat(gcjLng - 105, gcjLat - 35);
-  const dLng      = transformLng(gcjLng - 105, gcjLat - 35);
-  const radLat    = gcjLat / 180 * Math.PI;
-  let   magic     = Math.sin(radLat);
-  magic           = 1 - ee * magic * magic;
+  const dLat = transformLat(gcjLng - 105, gcjLat - 35);
+  const dLng = transformLng(gcjLng - 105, gcjLat - 35);
+  const radLat = gcjLat / 180 * Math.PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - ee * magic * magic;
   const sqrtMagic = Math.sqrt(magic);
 
   return {
@@ -71,15 +71,15 @@ function gcj02ToWgs84(gcjLng, gcjLat) {
 
 // ── GPS Quality Check ─────────────────────────────────────────────────────────
 function _isGpsReliable(satellites, accuracy, speed) {
-  if (satellites < 4)               return false;
-  if (accuracy > 25)                return false;
-  if (speed < 1 && accuracy > 10)   return false;
+  if (satellites < 4) return false;
+  if (accuracy > 25) return false;
+  if (speed < 1 && accuracy > 10) return false;
   return true;
 }
 
 // ── Nominatim geocode queue ───────────────────────────────────────────────────
 const _geocodeCache = new Map();
-let   _geocodeQueue = Promise.resolve();
+let _geocodeQueue = Promise.resolve();
 
 function getManualAddressOverride(lat, lng) {
   if (lat >= 20.37 && lat <= 20.38 && lng >= 72.92 && lng <= 72.93) {
@@ -128,7 +128,7 @@ function _reverseGeocode(lat, lng) {
         }
 
         const res = await axios.get('https://nominatim.openstreetmap.org/reverse', {
-          params:  { lat, lon: lng, format: 'json', zoom: 18 },
+          params: { lat, lon: lng, format: 'json', zoom: 18 },
           headers: { 'User-Agent': 'NVIQFleetServer/1.0' },
           timeout: 5000,
         });
@@ -152,9 +152,9 @@ function _reverseGeocode(lat, lng) {
 }
 
 // ── Duplicate guard ───────────────────────────────────────────────────────────
-const DEDUP_WINDOW_MS   = 10 * 1000;
+const DEDUP_WINDOW_MS = 10 * 1000;
 const DEDUP_MIN_DIST_KM = 0.005;
-const _lastStored       = new Map();
+const _lastStored = new Map();
 
 function _isDuplicate(imei, lat, lng, ts) {
   const prev = _lastStored.get(imei);
@@ -174,7 +174,7 @@ function _markStored(imei, lat, lng, ts) {
 const _lastGoodPoint = new Map(); // imei → { lat, lng }
 
 function _bearingDeg(lat1, lng1, lat2, lng2) {
-  const dLng  = (lng2 - lng1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
   const lat1r = lat1 * Math.PI / 180;
   const lat2r = lat2 * Math.PI / 180;
   const y = Math.sin(dLng) * Math.cos(lat2r);
@@ -198,7 +198,7 @@ function _isBearingConsistent(imei, lat, lng, deviceHeading, accuracy) {
   if (distKm < 0.030) return true; // < 30 m: bearing calc is unreliable
 
   const bearing = _bearingDeg(prev.lat, prev.lng, lat, lng);
-  const diff    = _headingDiff(deviceHeading, bearing);
+  const diff = _headingDiff(deviceHeading, bearing);
 
   if (diff > 90 && accuracy > 20) {
     logger.debug(
@@ -252,10 +252,10 @@ function _updateStatusSince(imei, currentStatus, ts) {
 const _dailyDist = new Map();
 
 function _getDateStr(date) {
-  const d     = new Date(date);
-  const year  = d.getFullYear();
+  const d = new Date(date);
+  const year = d.getFullYear();
   const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day   = String(d.getDate()).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
@@ -266,7 +266,7 @@ function _getTodayStr() {
 // FIX-IGN-3: ignitionOn now accepts the effective ignition (after inference)
 function _addDailyDistance(imei, lat, lng, speed, ignitionOn) {
   const today = _getTodayStr();
-  const prev  = _dailyDist.get(imei);
+  const prev = _dailyDist.get(imei);
 
   if (!prev || prev.dateStr !== today) {
     _dailyDist.set(imei, { distKm: 0, lastLat: lat, lastLng: lng, dateStr: today });
@@ -291,7 +291,7 @@ const _engineHours = new Map();
 // FIX-IGN-3: ignitionOn accepts the effective ignition (after inference)
 function _updateEngineHours(imei, ignitionOn, pointTs) {
   const today = _getTodayStr();
-  const prev  = _engineHours.get(imei);
+  const prev = _engineHours.get(imei);
 
   if (!prev || prev.dateStr !== today) {
     _engineHours.set(imei, { hoursToday: 0, lastTs: pointTs, ignitionOn, dateStr: today });
@@ -317,7 +317,7 @@ const _runningHours = new Map();
 
 function _updateRunningHours(imei, ignitionOn, speed, pointTs) {
   const today = _getTodayStr();
-  const prev  = _runningHours.get(imei);
+  const prev = _runningHours.get(imei);
 
   if (!prev || prev.dateStr !== today) {
     _runningHours.set(imei, { hoursToday: 0, lastTs: pointTs, speed, dateStr: today });
@@ -370,14 +370,14 @@ setInterval(() => {
 
 // ── Trip detection ────────────────────────────────────────────────────────────
 const TRIP_START_SPEED_KMH = 5;
-const TRIP_IDLE_END_MS     = 3 * 60 * 1000;
+const TRIP_IDLE_END_MS = 3 * 60 * 1000;
 
 async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestamp, hasValidGPS }) {
   if (!vehicleId || !hasValidGPS) return;
 
-  const Trip     = require('../models/Trip');
+  const Trip = require('../models/Trip');
   const isMoving = speed > TRIP_START_SPEED_KMH;
-  const prev     = _tripState.get(imei) ?? {
+  const prev = _tripState.get(imei) ?? {
     tripId: null, idleSince: null,
     lastLat: null, lastLng: null,
     maxSpeed: 0, totalDistance: 0, speedReadings: [],
@@ -389,8 +389,8 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
     if (!isNoisePoint(raw)) segKm = raw;
   }
 
-  const newTotal    = prev.totalDistance + segKm;
-  const newMax      = Math.max(prev.maxSpeed, speed);
+  const newTotal = prev.totalDistance + segKm;
+  const newMax = Math.max(prev.maxSpeed, speed);
   const newReadings = isMoving ? [...prev.speedReadings, speed] : prev.speedReadings;
 
   if (isMoving) {
@@ -399,15 +399,15 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
       try {
         const trip = await Trip.create({
           vehicleId, imei,
-          startTime:     timestamp,
+          startTime: timestamp,
           startLocation: { latitude: lat, longitude: lng },
-          isCompleted:   false,
+          isCompleted: false,
         });
         tripId = trip._id;
         logger.info('🚗 Trip STARTED | imei=%s | tripId=%s', imei, tripId);
         if (global.io) {
           global.io.emit('trip_started', {
-            tripId:    tripId.toString(),
+            tripId: tripId.toString(),
             vehicleId: vehicleId.toString(),
             imei,
           });
@@ -448,13 +448,13 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
     const openTrip = await Trip.findById(prev.tripId);
     if (openTrip && !openTrip.isCompleted) {
       const duration = Math.max(0, Math.round((timestamp - openTrip.startTime) / 60000));
-      openTrip.endTime       = timestamp;
-      openTrip.duration      = duration;
-      openTrip.endLocation   = { latitude: lat, longitude: lng };
+      openTrip.endTime = timestamp;
+      openTrip.duration = duration;
+      openTrip.endLocation = { latitude: lat, longitude: lng };
       openTrip.totalDistance = parseFloat(newTotal.toFixed(3));
-      openTrip.maxSpeed      = parseFloat(newMax.toFixed(1));
-      openTrip.avgSpeed      = parseFloat(avgSpeed.toFixed(1));
-      openTrip.isCompleted   = true;
+      openTrip.maxSpeed = parseFloat(newMax.toFixed(1));
+      openTrip.avgSpeed = parseFloat(avgSpeed.toFixed(1));
+      openTrip.isCompleted = true;
       await openTrip.save();
 
       logger.info(
@@ -464,11 +464,11 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
 
       if (global.io) {
         global.io.emit('trip_ended', {
-          tripId:        prev.tripId.toString(),
-          vehicleId:     vehicleId.toString(),
+          tripId: prev.tripId.toString(),
+          vehicleId: vehicleId.toString(),
           imei,
           totalDistance: openTrip.totalDistance,
-          duration:      openTrip.duration,
+          duration: openTrip.duration,
         });
       }
     }
@@ -487,64 +487,64 @@ async function _handleTripDetection({ vehicleId, imei, speed, lat, lng, timestam
 // FIX-IGN-4: dev.acc from poller is already the parsed boolean|null from parseIgnition()
 function _normalizeWanway(dev) {
   return {
-    imei:     String(dev.imei || dev.imeino || dev.deviceId || ''),
-    rawLat:   dev.lat  ?? dev.latitude  ?? null,
-    rawLng:   dev.lng  ?? dev.longitude ?? null,
-    speed:    parseFloat(dev.speed   ?? 0),
-    heading:  parseFloat(dev.course  ?? dev.heading ?? 0),
+    imei: String(dev.imei || dev.imeino || dev.deviceId || ''),
+    rawLat: dev.lat ?? dev.latitude ?? null,
+    rawLng: dev.lng ?? dev.longitude ?? null,
+    speed: parseFloat(dev.speed ?? 0),
+    heading: parseFloat(dev.course ?? dev.heading ?? 0),
     altitude: parseFloat(dev.altitude ?? 0),
     satellites: parseInt(dev.satellites ?? dev.gpsNum ?? 0, 10),
-    accuracy:   parseFloat(dev.accuracy ?? dev.hdop ?? 0),
-    voltage:    dev.extVoltage != null ? dev.extVoltage : null,
-    odometer:   dev.odometer ?? dev.mileage ?? null,
+    accuracy: parseFloat(dev.accuracy ?? dev.hdop ?? 0),
+    voltage: dev.extVoltage != null ? dev.extVoltage : null,
+    odometer: dev.odometer ?? dev.mileage ?? null,
     // dev.acc is the pre-parsed boolean|null from wanway.poller.js parseIgnition()
-    ignition:   dev.acc,
-    address:    dev.address ?? dev.location ?? null,
-    gpsTimestampMs:    dev.gpsTime    ? dev.gpsTime    * 1000 : null,
+    ignition: dev.acc,
+    address: dev.address ?? dev.location ?? null,
+    gpsTimestampMs: dev.gpsTime ? dev.gpsTime * 1000 : null,
     signalTimestampMs: dev.signalTime ? dev.signalTime * 1000 : null,
-    source:             'wanway',
+    source: 'wanway',
     needsGcjConversion: false,
   };
 }
 
 function _normalizeMultitrack(dev) {
   return {
-    imei:     String(dev.imei || ''),
-    rawLat:   dev.lat  ?? null,
-    rawLng:   dev.lng  ?? null,
-    speed:    parseFloat(dev.speed ?? 0),
-    heading:  parseFloat(dev.course ?? 0),
+    imei: String(dev.imei || ''),
+    rawLat: dev.lat ?? null,
+    rawLng: dev.lng ?? null,
+    speed: parseFloat(dev.speed ?? 0),
+    heading: parseFloat(dev.course ?? 0),
     altitude: parseFloat(dev.altitude ?? 0),
     satellites: parseInt(dev.satellites ?? 0, 10),
-    accuracy:   parseFloat(dev.accuracy ?? 0),
-    voltage:    dev.extVoltage ?? null,
-    odometer:   dev.odometer ?? null,
-    ignition:   dev.acc != null ? Boolean(Number(dev.acc)) : null,
-    address:    dev.address ?? null,
-    gpsTimestampMs:    dev.gpsTime    ? dev.gpsTime    * 1000 : null,
+    accuracy: parseFloat(dev.accuracy ?? 0),
+    voltage: dev.extVoltage ?? null,
+    odometer: dev.odometer ?? null,
+    ignition: dev.acc != null ? Boolean(Number(dev.acc)) : null,
+    address: dev.address ?? null,
+    gpsTimestampMs: dev.gpsTime ? dev.gpsTime * 1000 : null,
     signalTimestampMs: dev.signalTime ? dev.signalTime * 1000 : null,
-    source:             'multitrack',
+    source: 'multitrack',
     needsGcjConversion: false,
   };
 }
 
 function _normalizeTcp(dev) {
   return {
-    imei:     String(dev.imei || ''),
-    rawLat:   dev.latitude  ?? dev.lat  ?? null,
-    rawLng:   dev.longitude ?? dev.lng  ?? null,
-    speed:    parseFloat(dev.speed   ?? 0),
-    heading:  parseFloat(dev.heading ?? dev.course ?? 0),
+    imei: String(dev.imei || ''),
+    rawLat: dev.latitude ?? dev.lat ?? null,
+    rawLng: dev.longitude ?? dev.lng ?? null,
+    speed: parseFloat(dev.speed ?? 0),
+    heading: parseFloat(dev.heading ?? dev.course ?? 0),
     altitude: parseFloat(dev.altitude ?? 0),
     satellites: parseInt(dev.satellites ?? 0, 10),
-    accuracy:   parseFloat(dev.accuracy  ?? 0),
-    voltage:    dev.voltage  ?? null,
-    odometer:   dev.odometer ?? null,
-    ignition:   dev.ignition ?? null,
-    address:    null,
-    gpsTimestampMs:    dev.gpsTimestamp ? new Date(dev.gpsTimestamp).getTime() : null,
+    accuracy: parseFloat(dev.accuracy ?? 0),
+    voltage: dev.voltage ?? null,
+    odometer: dev.odometer ?? null,
+    ignition: dev.ignition ?? null,
+    address: null,
+    gpsTimestampMs: dev.gpsTimestamp ? new Date(dev.gpsTimestamp).getTime() : null,
     signalTimestampMs: Date.now(),
-    source:             'tcp',
+    source: 'tcp',
     needsGcjConversion: false,
   };
 }
@@ -553,16 +553,16 @@ function _normalizeTcp(dev) {
 // processIncomingData — MAIN ENTRY POINT (single device)
 // ─────────────────────────────────────────────────────────────────────────────
 async function processIncomingData(rawDevice, source = 'wanway') {
-  const Vehicle      = require('../models/Vehicle');
-  const RawGpsLog    = require('../models/RawGpsLog');
+  const Vehicle = require('../models/Vehicle');
+  const RawGpsLog = require('../models/RawGpsLog');
   const LocationPing = require('../models/LocationPing');
-  const now          = new Date();
+  const now = new Date();
 
   // 1. Normalize
   let dev;
-  if (source === 'tcp')        dev = _normalizeTcp(rawDevice);
+  if (source === 'tcp') dev = _normalizeTcp(rawDevice);
   else if (source === 'multitrack') dev = _normalizeMultitrack(rawDevice);
-  else                         dev = _normalizeWanway(rawDevice);
+  else dev = _normalizeWanway(rawDevice);
 
   if (!dev.imei) {
     logger.warn('⚠️ [Processor] Received device with no IMEI — skipped');
@@ -570,7 +570,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   }
 
   // 2. Timestamps
-  const gpsTs    = dev.gpsTimestampMs    ? new Date(dev.gpsTimestampMs)    : now;
+  const gpsTs = dev.gpsTimestampMs ? new Date(dev.gpsTimestampMs) : now;
   const signalTs = dev.signalTimestampMs ? new Date(dev.signalTimestampMs) : now;
 
   // 3. Coordinate conversion
@@ -604,16 +604,16 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   let ignitionSource;
   if (dev.ignition !== null && dev.ignition !== undefined) {
     effectiveIgnition = dev.ignition;
-    ignitionSource    = 'reported';
+    ignitionSource = 'reported';
   } else {
     // Infer from speed — if moving, engine must be on
     effectiveIgnition = dev.speed > 1;
-    ignitionSource    = 'inferred';
+    ignitionSource = 'inferred';
   }
 
   // 4. Online / status
   const isOnline = (Date.now() - signalTs.getTime()) < 5 * 60 * 1000;
-  const status   = !isOnline
+  const status = !isOnline
     ? 'offline'
     : dev.speed > TRIP_START_SPEED_KMH
       ? 'moving'
@@ -752,16 +752,16 @@ async function processIncomingData(rawDevice, source = 'wanway') {
 
   // 7. Compute running daily totals
   let todayDistKm = 0;
-  let engineHrs   = 0;
-  let runningHrs  = 0;
+  let engineHrs = 0;
+  let runningHrs = 0;
   let delta = 0;
 
   if (hasValidGPS && !isDuplicate) {
     const dailyRec = _dailyDist.get(dev.imei);
     todayDistKm = _addDailyDistance(dev.imei, lat, lng, dev.speed, effectiveIgnition);
-    engineHrs   = _updateEngineHours(dev.imei, effectiveIgnition, gpsTs.getTime());
-    runningHrs  = _updateRunningHours(dev.imei, effectiveIgnition, dev.speed, gpsTs.getTime());
-    
+    engineHrs = _updateEngineHours(dev.imei, effectiveIgnition, gpsTs.getTime());
+    runningHrs = _updateRunningHours(dev.imei, effectiveIgnition, dev.speed, gpsTs.getTime());
+
     // Calculate delta segment driven in this tick
     if (dailyRec && dailyRec.lastLat != null && dev.speed > 1 && effectiveIgnition) {
       const raw = haversineKm(dailyRec.lastLat, dailyRec.lastLng, lat, lng);
@@ -770,11 +770,11 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   } else if (hasValidGPS) {
     // Duplicate — return current accumulator without incrementing
     const dailyRec = _dailyDist.get(dev.imei);
-    const engRec   = _engineHours.get(dev.imei);
-    const runRec   = _runningHours.get(dev.imei);
-    todayDistKm = dailyRec?.distKm   ?? 0;
-    engineHrs   = engRec?.hoursToday ?? 0;
-    runningHrs  = runRec?.hoursToday  ?? 0;
+    const engRec = _engineHours.get(dev.imei);
+    const runRec = _runningHours.get(dev.imei);
+    todayDistKm = dailyRec?.distKm ?? 0;
+    engineHrs = engRec?.hoursToday ?? 0;
+    runningHrs = runRec?.hoursToday ?? 0;
   }
 
   // 7b. Update max speed in memory
@@ -810,21 +810,21 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   if (hasValidGPS) {
     try {
       await RawGpsLog.create({
-        imei:            dev.imei,
+        imei: dev.imei,
         vehicleId,
-        latitude:        lat,
-        longitude:       lng,
-        speed:           dev.speed,
-        heading:         dev.heading,
-        ignition:        effectiveIgnition,  // store effective, not raw null
+        latitude: lat,
+        longitude: lng,
+        speed: dev.speed,
+        heading: dev.heading,
+        ignition: effectiveIgnition,  // store effective, not raw null
         status,
-        source:          dev.source,
-        gpsTimestamp:    gpsTs,
+        source: dev.source,
+        gpsTimestamp: gpsTs,
         serverTimestamp: now,
-        satellites:      dev.satellites,
-        accuracy:        dev.accuracy,
-        voltage:         dev.voltage,
-        odometer:        dev.odometer,
+        satellites: dev.satellites,
+        accuracy: dev.accuracy,
+        voltage: dev.voltage,
+        odometer: dev.odometer,
         isDuplicate,
       });
     } catch (err) {
@@ -836,7 +836,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   // Poor-accuracy post-turn drift points still land in RawGpsLog above but are
   // excluded from the route visualization layer to prevent zig-zag rendering.
   const gpsQualityOk = _isGpsReliable(dev.satellites, dev.accuracy, dev.speed);
-  const bearingOk    = hasValidGPS
+  const bearingOk = hasValidGPS
     ? _isBearingConsistent(dev.imei, lat, lng, dev.heading, dev.accuracy)
     : true;
 
@@ -845,24 +845,24 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       _lastGoodPoint.set(dev.imei, { lat, lng });
       try {
         await LocationPing.create({
-          vehicleId:        vehicleId.toString(),
-          imei:             dev.imei,
-          latitude:         lat,
-          longitude:        lng,
-          speed:            dev.speed,
-          heading:          dev.heading,
-          altitude:         dev.altitude,
-          accuracy:         dev.accuracy,
-          satellites:       dev.satellites,
-          batteryVoltage:   dev.voltage,
-          ignitionOn:       effectiveIgnition,
-          gpsTime:          gpsTs,
-          deviceTime:       now,
-          address:          null,
+          vehicleId: vehicleId.toString(),
+          imei: dev.imei,
+          latitude: lat,
+          longitude: lng,
+          speed: dev.speed,
+          heading: dev.heading,
+          altitude: dev.altitude,
+          accuracy: dev.accuracy,
+          satellites: dev.satellites,
+          batteryVoltage: dev.voltage,
+          ignitionOn: effectiveIgnition,
+          gpsTime: gpsTs,
+          deviceTime: now,
+          address: null,
           serverOdometerKm: dev.odometer ?? 0,
-          todayDistance:    todayDistKm,
-          engineHours:      engineHrs,
-          source:           dev.source,
+          todayDistance: todayDistKm,
+          engineHours: engineHrs,
+          source: dev.source,
         });
       } catch (err) {
         logger.error('❌ [Processor] LocationPing insert failed for IMEI=%s: %s', dev.imei, err.message);
@@ -891,8 +891,8 @@ async function processIncomingData(rawDevice, source = 'wanway') {
         await Vehicle.findByIdAndUpdate(vehicleId, {
           $set: { address: addr, location: addr, formattedLocation: addr },
         });
-      } catch (_) {}
-    }).catch(() => {});
+      } catch (_) { }
+    }).catch(() => { });
   }
 
   if (!address && hasValidGPS) {
@@ -908,19 +908,19 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   // FIX-ODO: Only overwrite odometer if incoming value > existing
   // (prevents backwards odometer when device briefly sends 0)
   const vehicleUpdate = {
-    speed:            dev.speed,
-    heading:          dev.heading,
+    speed: dev.speed,
+    heading: dev.heading,
     isOnline,
-    isLive:           isOnline,
-    lastUpdate:       now,
+    isLive: isOnline,
+    lastUpdate: now,
     status,
-    todayDistance:    todayDistKm,       // ← always written
+    todayDistance: todayDistKm,       // ← always written
     todayEngineHours: engineHrs,         // ← always written
     todayRunningHours: runningHrs,       // ← always written
-    todayMaxSpeed:    currentMaxSpeed,   // ← always written
-    todayStops:       currentStops,      // ← always written
-    satellites:       dev.satellites,
-    accuracy:         dev.accuracy,
+    todayMaxSpeed: currentMaxSpeed,   // ← always written
+    todayStops: currentStops,      // ← always written
+    satellites: dev.satellites,
+    accuracy: dev.accuracy,
   };
 
   if (dev.ignition !== null && dev.ignition !== undefined) {
@@ -929,31 +929,31 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     vehicleUpdate.ignitionOn = effectiveIgnition;
   }
   vehicleUpdate.ignitionSince = ignitionSince ?? null;
-  vehicleUpdate.statusSince   = statusSince;
+  vehicleUpdate.statusSince = statusSince;
 
   if (hasValidGPS) {
-    vehicleUpdate.latitude  = lat;
+    vehicleUpdate.latitude = lat;
     vehicleUpdate.longitude = lng;
-    vehicleUpdate.lat       = lat;
-    vehicleUpdate.lng       = lng;
-    if (dev.voltage  != null) vehicleUpdate.batteryVoltage = dev.voltage;
+    vehicleUpdate.lat = lat;
+    vehicleUpdate.lng = lng;
+    if (dev.voltage != null) vehicleUpdate.batteryVoltage = dev.voltage;
     vehicleUpdate.lastKnownLocation = {
-      latitude:   lat,
-      longitude:  lng,
-      speed:      dev.speed,
-      heading:    dev.heading,
-      altitude:   dev.altitude,
-      voltage:    dev.voltage,
-      odometer:   dev.odometer,
-      address:    address ?? null,
-      timestamp:  gpsTs,
+      latitude: lat,
+      longitude: lng,
+      speed: dev.speed,
+      heading: dev.heading,
+      altitude: dev.altitude,
+      voltage: dev.voltage,
+      odometer: dev.odometer,
+      address: address ?? null,
+      timestamp: gpsTs,
       serverTime: now,
     };
   }
 
   if (address) {
-    vehicleUpdate.address           = address;
-    vehicleUpdate.location          = address;
+    vehicleUpdate.address = address;
+    vehicleUpdate.location = address;
     vehicleUpdate.formattedLocation = address;
   }
 
@@ -985,83 +985,83 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   // FIX-SOCK: gpsTime = device GPS fix time (not server time)
   // This fixes the "20m ago" display in Flutter
   if (global.io && hasValidGPS) {
-    const gpsReliable  = _isGpsReliable(dev.satellites, dev.accuracy, dev.speed);
+    const gpsReliable = _isGpsReliable(dev.satellites, dev.accuracy, dev.speed);
     const displaySpeed = (effectiveIgnition && gpsReliable) ? dev.speed : 0;
 
     global.io.emit('vehicleMovement', {
-      id:               vehicleId.toString(),
-      vehicleId:        vehicleId.toString(),
-      imei:             dev.imei,
-      lat,  lng,
-      latitude:         lat,
-      longitude:        lng,
-      speed:            displaySpeed,
-      heading:          dev.heading,
+      id: vehicleId.toString(),
+      vehicleId: vehicleId.toString(),
+      imei: dev.imei,
+      lat, lng,
+      latitude: lat,
+      longitude: lng,
+      speed: displaySpeed,
+      heading: dev.heading,
       isOnline,
-      isLive:           isOnline,
+      isLive: isOnline,
       status,
 
       // All ignition aliases Flutter checks
-      ignition:         effectiveIgnition,
-      ignitionOn:       effectiveIgnition,
-      acc:              effectiveIgnition,
-      ACC:              effectiveIgnition,
-      engine:           effectiveIgnition,
-      engineOn:         effectiveIgnition,
-      power:            effectiveIgnition,
+      ignition: effectiveIgnition,
+      ignitionOn: effectiveIgnition,
+      acc: effectiveIgnition,
+      ACC: effectiveIgnition,
+      engine: effectiveIgnition,
+      engineOn: effectiveIgnition,
+      power: effectiveIgnition,
       // When ignition turned ON — Flutter uses this to calculate "ignition for X mins"
-      ignitionSince:    ignitionSince ? ignitionSince.toISOString() : null,
-      statusSince:      statusSince ? statusSince.toISOString() : null,
+      ignitionSince: ignitionSince ? ignitionSince.toISOString() : null,
+      statusSince: statusSince ? statusSince.toISOString() : null,
 
-      satellites:       dev.satellites,
-      accuracy:         dev.accuracy,
+      satellites: dev.satellites,
+      accuracy: dev.accuracy,
 
       // All voltage aliases Flutter checks
-      voltage:          dev.voltage,
+      voltage: dev.voltage,
       external_voltage: dev.voltage,
-      bat_v:            dev.voltage,
-      battery:          dev.voltage,
+      bat_v: dev.voltage,
+      battery: dev.voltage,
 
       address,
-      location:          address,
+      location: address,
       formattedLocation: address,
       lastKnownLocation: vehicleUpdate.lastKnownLocation ?? null,
 
       // FIX-SOCK: GPS fix time first, server time as fallback
       // Flutter _onMovement reads: gpsTime, fix_time, gpsFixTime (first group)
       // then deviceTime (second group), then timestamp (last resort)
-      gpsTime:    gpsTs.toISOString(),     // ← device GPS fix time
-      fix_time:   gpsTs.toISOString(),
+      gpsTime: gpsTs.toISOString(),     // ← device GPS fix time
+      fix_time: gpsTs.toISOString(),
       gpsFixTime: gpsTs.toISOString(),
       deviceTime: now.toISOString(),
       lastUpdate: now.toISOString(),
-      timestamp:  now.toISOString(),
+      timestamp: now.toISOString(),
 
       // All distance/odometer aliases Flutter checks
       todayDistanceKm: todayDistKm,
-      todayDistance:  todayDistKm,
-      todayKm:        todayDistKm,
-      today_km:       todayDistKm,
-      dailyDistance:  todayDistKm,
+      todayDistance: todayDistKm,
+      todayKm: todayDistKm,
+      today_km: todayDistKm,
+      dailyDistance: todayDistKm,
 
       // Engine hours aliases
       engineHoursToday: engineHrs,
       todayEngineHours: engineHrs,
-      engineHours:    engineHrs,
+      engineHours: engineHrs,
 
       // Running hours aliases
       todayRunningHours: runningHrs,
       runningHoursToday: runningHrs,
-      runningHours:      runningHrs,
+      runningHours: runningHrs,
 
-      todayMaxSpeed:  currentMaxSpeed,
-      todayStops:     currentStops,
+      todayMaxSpeed: currentMaxSpeed,
+      todayStops: currentStops,
 
       // Odometer — Flutter reads: mileage, odometer, totalDistance, totalKm
-      odometer:      dev.odometer ?? vehicle.odometer ?? 0,
-      mileage:       dev.odometer ?? vehicle.odometer ?? 0,
+      odometer: dev.odometer ?? vehicle.odometer ?? 0,
+      mileage: dev.odometer ?? vehicle.odometer ?? 0,
       totalDistance: dev.odometer ?? vehicle.odometer ?? 0,
-      totalKm:       dev.odometer ?? vehicle.odometer ?? 0,
+      totalKm: dev.odometer ?? vehicle.odometer ?? 0,
 
       source: dev.source,
     });
