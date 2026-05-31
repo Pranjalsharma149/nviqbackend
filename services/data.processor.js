@@ -621,7 +621,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
 
   // 5. Resolve vehicle
   const vehicle = await Vehicle.findOne({ imei: dev.imei })
-    .select('_id imei lastKnownLocation odometer ignitionOn ignitionSince statusSince status todayDistance todayEngineHours todayRunningHours todayMaxSpeed lastUpdate latitude longitude')
+    .select('_id imei address location lastKnownLocation odometer ignitionOn ignitionSince statusSince status todayDistance todayEngineHours todayRunningHours todayMaxSpeed lastUpdate latitude longitude')
     .lean();
   if (!vehicle) {
     logger.warn('⚠️ [Processor] Unknown IMEI=%s — not in DB', dev.imei);
@@ -832,6 +832,24 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     }
   }
 
+  // 9. Address resolution
+  let address = null;
+  if (dev.address?.trim().length > 0) {
+    address = dev.address.trim();
+  } else if (hasValidGPS) {
+    if (isDuplicate) {
+      address = vehicle.address || vehicle.location || vehicle.lastKnownLocation?.address;
+    }
+    if (!address) {
+      const { getAddressForCoords } = require('../utils/addressFetch');
+      address = await getAddressForCoords(lat, lng, vehicleId);
+    }
+  }
+
+  if (!address && hasValidGPS) {
+    address = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+  }
+
   // 8b. Store LocationPing — only when GPS quality and bearing are trustworthy.
   // Poor-accuracy post-turn drift points still land in RawGpsLog above but are
   // excluded from the route visualization layer to prevent zig-zag rendering.
@@ -858,7 +876,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
           ignitionOn: effectiveIgnition,
           gpsTime: gpsTs,
           deviceTime: now,
-          address: null,
+          address: address ?? null,
           serverOdometerKm: dev.odometer ?? 0,
           todayDistance: todayDistKm,
           engineHours: engineHrs,
@@ -873,30 +891,6 @@ async function processIncomingData(rawDevice, source = 'wanway') {
         dev.imei, gpsQualityOk, bearingOk, Math.round(dev.accuracy)
       );
     }
-  }
-
-  // 9. Address resolution (async, non-blocking)
-  let address = null;
-  if (dev.address?.trim().length > 0) {
-    address = dev.address.trim();
-  } else if (hasValidGPS && !isDuplicate) {
-    _reverseGeocode(lat, lng).then(async addr => {
-      if (!addr) return;
-      address = addr;
-      try {
-        await LocationPing.findOneAndUpdate(
-          { vehicleId: vehicleId.toString(), gpsTime: gpsTs },
-          { $set: { address: addr } }
-        );
-        await Vehicle.findByIdAndUpdate(vehicleId, {
-          $set: { address: addr, location: addr, formattedLocation: addr },
-        });
-      } catch (_) { }
-    }).catch(() => { });
-  }
-
-  if (!address && hasValidGPS) {
-    address = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
   }
 
   // 10. Update Vehicle document

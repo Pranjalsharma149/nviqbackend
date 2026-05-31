@@ -137,37 +137,17 @@ async function computeDailyFromRaw(vehicleId, from, to) {
 
   const avgSpeed = speedCount > 0 ? speedSum / speedCount : 0;
 
-  // ── Stops ──────────────────────────────────────────────────────────────────
+  // ── Stops (transitions from moving to stopped) ─────────────────────────────
   let stopsCount = 0;
-  let stopStart = null;
-  const MIN_STOP_DURATION_SEC = 120; // 2 minutes
-
+  let wasMoving = false;
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
     const speed = p.speed || 0;
-    const isStopped = speed <= 5;
-
-    if (isStopped) {
-      if (stopStart === null) {
-        stopStart = p.gpsTimestamp;
-      }
-    } else {
-      if (stopStart !== null) {
-        const durationSec = Math.round((p.gpsTimestamp - stopStart) / 1000);
-        if (durationSec >= MIN_STOP_DURATION_SEC) {
-          stopsCount++;
-        }
-        stopStart = null;
-      }
-    }
-  }
-
-  if (stopStart !== null && points.length > 0) {
-    const lastPoint = points[points.length - 1];
-    const durationSec = Math.round((lastPoint.gpsTimestamp - stopStart) / 1000);
-    if (durationSec >= MIN_STOP_DURATION_SEC) {
+    const isMoving = speed > 5;
+    if (wasMoving && !isMoving) {
       stopsCount++;
     }
+    wasMoving = isMoving;
   }
 
   return {

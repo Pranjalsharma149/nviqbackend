@@ -106,6 +106,18 @@ async function runForDate(dateInput) {
             { upsert: true, new: true }
           );
 
+          // ── AUTOMATED HISTORY GENERATION ────────────────────────────────────
+          // Also pre-compute and store the History document for this day
+          const History = require('../models/History');
+          const { generateHistoryDoc } = require('../controllers/historyController');
+          const historyDoc = await generateHistoryDoc(v._id, v.imei, from);
+
+          await History.findOneAndUpdate(
+            { vehicleId: v._id, date: from },
+            { $set: historyDoc },
+            { upsert: true }
+          );
+
           successCount++;
 
           logger.debug(

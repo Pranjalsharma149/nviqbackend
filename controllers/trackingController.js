@@ -146,6 +146,32 @@ function buildSocketPayload(v) {
     address: v.address ?? v.lastKnownLocation?.address ?? '',
     location: v.address ?? '',
 
+    lastKnownLocation: v.lastKnownLocation ? {
+      latitude: v.lastKnownLocation.latitude,
+      longitude: v.lastKnownLocation.longitude,
+      lat: v.lastKnownLocation.latitude,
+      long: v.lastKnownLocation.longitude,
+      speed: v.lastKnownLocation.speed,
+      heading: v.lastKnownLocation.heading,
+      voltage: v.lastKnownLocation.voltage,
+      odometer: v.lastKnownLocation.odometer,
+      address: v.lastKnownLocation.address,
+      locationName: v.lastKnownLocation.address || '',
+      timestamp: v.lastKnownLocation.timestamp,
+    } : (v.latitude ? {
+      latitude: v.latitude,
+      longitude: v.longitude,
+      lat: v.latitude,
+      long: v.longitude,
+      speed: v.speed ?? 0,
+      heading: v.heading ?? 0,
+      voltage: v.batteryVoltage ?? 0,
+      odometer: v.odometer ?? 0,
+      address: v.address,
+      locationName: v.address || '',
+      timestamp: v.lastUpdate
+    } : null),
+
     lastUpdate: v.lastUpdate,
     lastOnlineAt: v.lastOnlineAt,
   };
@@ -168,8 +194,136 @@ exports.getLiveVehicles = async (req, res) => {
       .limit(2000)
       .lean();
 
+    // Calculate IST today boundaries
+    const now = new Date();
+    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const ist = new Date(utc + (3600000 * 5.5));
+    const yr = ist.getFullYear();
+    const mo = String(ist.getMonth() + 1).padStart(2, '0');
+    const dy = String(ist.getDate()).padStart(2, '0');
+    const istStart = new Date(Date.UTC(yr, mo - 1, dy - 1, 18, 30, 0, 0));
+    const istEnd = new Date(Date.UTC(yr, mo - 1, dy, 18, 29, 59, 999));
+
+    // 1. Calculate stops for today for all vehicles from RawGpsLog (using moving -> stopped transition)
+    const RawGpsLog = require('../models/RawGpsLog');
+    const allPoints = await RawGpsLog.find({
+      gpsTimestamp: { $gte: istStart, $lte: istEnd }
+    })
+      .sort({ gpsTimestamp: 1 })
+      .select('vehicleId speed')
+      .lean();
+
+    const pointsByVehicle = {};
+    for (const p of allPoints) {
+      if (!p.vehicleId) continue;
+      const vidStr = p.vehicleId.toString();
+      if (!pointsByVehicle[vidStr]) {
+        pointsByVehicle[vidStr] = [];
+      }
+      pointsByVehicle[vidStr].push(p);
+    }
+
+    const stopsMap = {};
+    for (const vidStr in pointsByVehicle) {
+      const points = pointsByVehicle[vidStr];
+      let stopsCount = 0;
+      let wasMoving = false;
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        const speed = p.speed || 0;
+        const isMoving = speed > 5;
+        if (wasMoving && !isMoving) {
+          stopsCount++;
+        }
+        wasMoving = isMoving;
+      }
+      stopsMap[vidStr] = stopsCount;
+    }
+
+    // 2. Fetch today's trips for all vehicles from Trip to calculate running time
+    const Trip = require('../models/Trip');
+    const allTrips = await Trip.find({
+      startTime: { $gte: istStart, $lte: istEnd }
+    }).lean();
+
+    const tripsByVehicle = {};
+    for (const t of allTrips) {
+      if (!t.vehicleId) continue;
+      const vidStr = t.vehicleId.toString();
+      if (!tripsByVehicle[vidStr]) {
+        tripsByVehicle[vidStr] = [];
+      }
+      tripsByVehicle[vidStr].push(t);
+    }
+
+    // Deduplicate function (same as historyController)
+    function getUniqueRunningTimeMins(vehicleTrips) {
+      if (!vehicleTrips || vehicleTrips.length === 0) return 0;
+      const sorted = [...vehicleTrips].sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime());
+      const unique = [];
+
+      for (const t of sorted) {
+        if (unique.length === 0) {
+          unique.push(t);
+          continue;
+        }
+
+        const last = unique[unique.length - 1];
+        const diffMs = Math.abs(new Date(t.startTime).getTime() - new Date(last.startTime).getTime());
+
+        if (diffMs <= 60 * 1000) {
+          last.duration = Math.max(last.duration || 0, t.duration || 0);
+          if (t.endTime && (!last.endTime || new Date(t.endTime) > new Date(last.endTime))) {
+            last.endTime = t.endTime;
+          }
+        } else {
+          unique.push(t);
+        }
+      }
+
+      let runningTimeMins = 0;
+      for (const t of unique) {
+        runningTimeMins += t.duration || 0;
+      }
+      return runningTimeMins;
+    }
+
+    const runningTimeMap = {};
+    for (const vidStr in tripsByVehicle) {
+      runningTimeMap[vidStr] = getUniqueRunningTimeMins(tripsByVehicle[vidStr]);
+    }
+
     const data = vehicles.map(v => {
       const lkl = v.lastKnownLocation;
+      const vidStr = v._id.toString();
+      const correctStops = stopsMap[vidStr] ?? 0;
+
+      // Calculate running time (same logic as history API)
+      let runningTimeMins = Math.round(runningTimeMap[vidStr] ?? 0);
+      if (runningTimeMins === 0 && v.todayRunningHours) {
+        // Fallback to todayRunningHours in minutes if no trips recorded
+        runningTimeMins = Math.round(v.todayRunningHours * 60);
+      }
+      const runningHours = runningTimeMins / 60;
+      const runH = Math.floor(runningTimeMins / 60);
+      const runM = Math.floor(runningTimeMins % 60);
+      const running_time = `${runH}h ${runM}m`;
+
+      // Self-heal the database values if they are out of sync
+      const needsUpdate = (v.todayStops !== correctStops) || (Math.abs((v.todayRunningHours ?? 0) - runningHours) > 0.01);
+      if (needsUpdate) {
+        Vehicle.updateOne(
+          { _id: v._id },
+          {
+            $set: {
+              todayStops: correctStops,
+              todayRunningHours: runningHours
+            }
+          }
+        ).catch(err =>
+          logger.error('Failed to sync live metrics for vehicle %s: %s', vidStr, err.message)
+        );
+      }
 
       // Best coords: live → lastKnownLocation → null
       let lat = null, lng = null;
@@ -226,7 +380,7 @@ exports.getLiveVehicles = async (req, res) => {
         status: v.status ?? 'offline',
 
         // today stops
-        todayStops: v.todayStops ?? 0,
+        todayStops: correctStops,
 
         // Flutter FIX-3: ignition
         ignition: v.ignitionOn ?? false,
@@ -247,22 +401,37 @@ exports.getLiveVehicles = async (req, res) => {
         isLive: v.isLive ?? false,
 
         // Address — all aliases Flutter checks
-        address,
-        location: address,
-        formattedLocation: address,
-        formattedLocationStr: address,
+        // address,
+        // location: address,
+        // formattedLocation: address,
+        // formattedLocationStr: address,
         liveAddress: address,
 
         lastKnownLocation: lkl ? {
           latitude: lkl.latitude,
           longitude: lkl.longitude,
+          lat: lkl.latitude,
+          long: lkl.longitude,
           speed: lkl.speed,
           heading: lkl.heading,
           voltage: lkl.voltage,
           odometer: lkl.odometer,
           address: lkl.address,
+          locationName: lkl.address || '',
           timestamp: lkl.timestamp,
-        } : (lat ? { latitude: lat, longitude: lng, address, timestamp: v.lastUpdate } : null),
+        } : (lat ? {
+          latitude: lat,
+          longitude: lng,
+          lat: lat,
+          long: lng,
+          speed: v.speed ?? 0,
+          heading: v.heading ?? 0,
+          voltage: v.batteryVoltage ?? 0,
+          odometer: v.odometer ?? 0,
+          address,
+          locationName: address || '',
+          timestamp: v.lastUpdate
+        } : null),
 
         lastUpdate: v.lastUpdate,
         lastGpsTime: v.lastUpdate,
@@ -281,9 +450,11 @@ exports.getLiveVehicles = async (req, res) => {
         // Flutter FIX-2: engine hours
         engineHoursToday: v.todayEngineHours ?? 0,
         todayEngineHours: v.todayEngineHours ?? 0,
-        todayRunningHours: v.todayRunningHours ?? 0,
-        runningHoursToday: v.todayRunningHours ?? 0,
-        runningHours: v.todayRunningHours ?? 0,
+        todayRunningHours: runningHours,
+        runningHoursToday: (runningHours),
+        runningHours: runningHours,
+        running_time,
+        runningTime: running_time,
         todayMaxSpeed: v.todayMaxSpeed ?? 0,
 
         pocName: v.pocName ?? '',
@@ -346,14 +517,12 @@ exports.batchUpdate = async (req, res) => {
         odometer: parseFloat(u.odometer ?? u.mileage) || 0,
         status,
         isOnline,
-        todayStops: u.todayStops || 0,
         isLive: isOnline,
         lastUpdate: u.timestamp ? new Date(u.timestamp) : now,
       };
 
-
-      if (previousStatus === 'moving' && currentStatus !== 'moving') {
-        baseSet.$inc = { todayStops: 1 };
+      if (u.todayStops !== undefined) {
+        baseSet.todayStops = u.todayStops;
       }
 
       if (hasValidGPS) {
@@ -361,17 +530,23 @@ exports.batchUpdate = async (req, res) => {
         baseSet.longitude = lng;
         baseSet.gpsSignal = true;
         baseSet.lastOnlineAt = u.timestamp ? new Date(u.timestamp) : now;
-        baseSet.address = u.address ?? null;
-        baseSet.lastKnownLocation = {
-          latitude: lat,
-          longitude: lng,
-          speed,
-          heading: baseSet.heading,
-          voltage: baseSet.batteryVoltage,
-          odometer: baseSet.odometer,
-          address: u.address ?? null,
-          timestamp: u.timestamp ? new Date(u.timestamp) : now,
-        };
+
+        baseSet['lastKnownLocation.latitude'] = lat;
+        baseSet['lastKnownLocation.longitude'] = lng;
+        baseSet['lastKnownLocation.lat'] = lat;
+        baseSet['lastKnownLocation.long'] = lng;
+        baseSet['lastKnownLocation.speed'] = speed;
+        baseSet['lastKnownLocation.heading'] = baseSet.heading;
+        baseSet['lastKnownLocation.voltage'] = baseSet.batteryVoltage;
+        baseSet['lastKnownLocation.odometer'] = baseSet.odometer;
+        baseSet['lastKnownLocation.timestamp'] = u.timestamp ? new Date(u.timestamp) : now;
+
+        if (u.address) {
+          baseSet.address = u.address;
+          baseSet.location = u.address;
+          baseSet['lastKnownLocation.address'] = u.address;
+          baseSet['lastKnownLocation.locationName'] = u.address;
+        }
       } else if (!isOnline) {
         baseSet.gpsSignal = false;
       }

@@ -196,6 +196,7 @@ async function boot() {
   app.use('/api/alerts', require('./routes/alerts.routes'));
   app.use('/api/notifications', require('./routes/notifications.routes'));
   app.use('/api/analytics', require('./routes/analytics.routes'));
+  app.use('/api/history', require('./routes/history.routes'));
   app.use('/api/support', require('./routes/support.routes'));
   app.use('/api/geofences', require('./routes/geofence.routes'));
   app.use('/api/trips', require('./routes/trip.routes'));

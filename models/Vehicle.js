@@ -175,6 +175,12 @@ const vehicleSchema = new mongoose.Schema(
       comment: 'Human-readable address',
     },
 
+    address: {
+      type: String,
+      default: null,
+      comment: 'Human-readable address (synced)',
+    },
+
     // ── DEVICE INFO ────────────────────────────────────────────────────────
     deviceId: {
       type: String,
@@ -210,6 +216,20 @@ const vehicleSchema = new mongoose.Schema(
         default: null,
         comment: 'Human-readable address of last location',
       },
+    },
+
+    lastKnownLocation: {
+      latitude: { type: Number, default: null },
+      longitude: { type: Number, default: null },
+      lat: { type: Number, default: null },
+      long: { type: Number, default: null },
+      speed: { type: Number, default: 0 },
+      heading: { type: Number, default: 0 },
+      voltage: { type: Number, default: 0 },
+      odometer: { type: Number, default: 0 },
+      address: { type: String, default: null },
+      locationName: { type: String, default: null },
+      timestamp: { type: Date, default: null },
     },
 
     // ── VEHICLE TELEMETRY (NEW) ────────────────────────────────────────────
