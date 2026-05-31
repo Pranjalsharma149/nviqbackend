@@ -312,13 +312,54 @@ function _updateEngineHours(imei, ignitionOn, pointTs) {
   return newHours;
 }
 
+// ── Running hours accumulator ─────────────────────────────────────────────────
+const _runningHours = new Map();
+
+function _updateRunningHours(imei, ignitionOn, speed, pointTs) {
+  const today = _getTodayStr();
+  const prev  = _runningHours.get(imei);
+
+  if (!prev || prev.dateStr !== today) {
+    _runningHours.set(imei, { hoursToday: 0, lastTs: pointTs, speed, dateStr: today });
+    return 0;
+  }
+
+  let addedHours = 0;
+  // Running condition: ignition ON (or inferred ON) and speed > 5 km/h
+  const isMoving = speed > 5;
+  if (ignitionOn && isMoving && prev.lastTs) {
+    const elapsedMs = pointTs - prev.lastTs;
+    if (elapsedMs > 0 && elapsedMs < 60 * 60 * 1000) {
+      addedHours = elapsedMs / (1000 * 3600);
+    }
+  }
+
+  const newHours = prev.hoursToday + addedHours;
+  _runningHours.set(imei, { hoursToday: newHours, lastTs: pointTs, speed, dateStr: today });
+  return newHours;
+}
+
 // ── Daily accumulator pruning ─────────────────────────────────────────────────
 const _tripState = new Map();
+const _todayMaxSpeed = new Map();
+const _todayStops = new Map();
 
 setInterval(() => {
   const today = _getTodayStr();
   for (const [imei, rec] of _dailyDist.entries()) {
     if (rec.dateStr !== today) _dailyDist.delete(imei);
+  }
+  for (const [imei, rec] of _engineHours.entries()) {
+    if (rec.dateStr !== today) _engineHours.delete(imei);
+  }
+  for (const [imei, rec] of _runningHours.entries()) {
+    if (rec.dateStr !== today) _runningHours.delete(imei);
+  }
+  for (const [imei, rec] of _todayMaxSpeed.entries()) {
+    if (rec.dateStr !== today) _todayMaxSpeed.delete(imei);
+  }
+  for (const [imei, rec] of _todayStops.entries()) {
+    if (rec.dateStr !== today) _todayStops.delete(imei);
   }
   for (const [imei, state] of _tripState.entries()) {
     if (!state.tripId) _tripState.delete(imei);
@@ -580,7 +621,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
 
   // 5. Resolve vehicle
   const vehicle = await Vehicle.findOne({ imei: dev.imei })
-    .select('_id imei lastKnownLocation odometer ignitionOn ignitionSince statusSince status todayDistance todayEngineHours todayMaxSpeed lastUpdate latitude longitude')
+    .select('_id imei lastKnownLocation odometer ignitionOn ignitionSince statusSince status todayDistance todayEngineHours todayRunningHours todayMaxSpeed lastUpdate latitude longitude')
     .lean();
   if (!vehicle) {
     logger.warn('⚠️ [Processor] Unknown IMEI=%s — not in DB', dev.imei);
@@ -591,7 +632,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   const today = _getTodayStr();
 
   // Seed daily metrics from RawGpsLog (self-healing) if not in memory
-  if (!_dailyDist.has(dev.imei) || !_engineHours.has(dev.imei)) {
+  if (!_dailyDist.has(dev.imei) || !_engineHours.has(dev.imei) || !_runningHours.has(dev.imei) || !_todayMaxSpeed.has(dev.imei) || !_todayStops.has(dev.imei)) {
     try {
       const todayStart = utcDayStart(now);
       const todayEnd = utcDayEnd(now);
@@ -611,10 +652,28 @@ async function processIncomingData(rawDevice, source = 'wanway') {
         dateStr: today,
       });
 
+      _runningHours.set(dev.imei, {
+        hoursToday: stats.runningHours ?? 0,
+        lastTs: gpsTs.getTime(),
+        dateStr: today,
+      });
+
+      _todayMaxSpeed.set(dev.imei, {
+        maxSpeed: stats.maxSpeed ?? 0,
+        dateStr: today,
+      });
+
+      _todayStops.set(dev.imei, {
+        stops: stats.todayStops ?? 0,
+        dateStr: today,
+      });
+
       // Update local vehicle cache with self-healed values for this tick's logic
       vehicle.todayDistance = stats.totalDistance ?? 0;
       vehicle.todayEngineHours = stats.engineHours ?? 0;
+      vehicle.todayRunningHours = stats.runningHours ?? 0;
       vehicle.todayMaxSpeed = stats.maxSpeed ?? 0;
+      vehicle.todayStops = stats.todayStops ?? 0;
 
     } catch (err) {
       logger.error('❌ [Processor] Failed to self-heal metrics for IMEI=%s: %s', dev.imei, err.message);
@@ -633,6 +692,25 @@ async function processIncomingData(rawDevice, source = 'wanway') {
           hoursToday: vehicle.todayEngineHours ?? 0,
           lastTs: vehicle.lastUpdate ? new Date(vehicle.lastUpdate).getTime() : null,
           ignitionOn: vehicle.ignitionOn ?? false,
+          dateStr: today,
+        });
+      }
+      if (!_runningHours.has(dev.imei)) {
+        _runningHours.set(dev.imei, {
+          hoursToday: vehicle.todayRunningHours ?? 0,
+          lastTs: vehicle.lastUpdate ? new Date(vehicle.lastUpdate).getTime() : null,
+          dateStr: today,
+        });
+      }
+      if (!_todayMaxSpeed.has(dev.imei)) {
+        _todayMaxSpeed.set(dev.imei, {
+          maxSpeed: vehicle.todayMaxSpeed ?? 0,
+          dateStr: today,
+        });
+      }
+      if (!_todayStops.has(dev.imei)) {
+        _todayStops.set(dev.imei, {
+          stops: vehicle.todayStops ?? 0,
           dateStr: today,
         });
       }
@@ -675,15 +753,57 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   // 7. Compute running daily totals
   let todayDistKm = 0;
   let engineHrs   = 0;
+  let runningHrs  = 0;
+  let delta = 0;
+
   if (hasValidGPS && !isDuplicate) {
+    const dailyRec = _dailyDist.get(dev.imei);
     todayDistKm = _addDailyDistance(dev.imei, lat, lng, dev.speed, effectiveIgnition);
     engineHrs   = _updateEngineHours(dev.imei, effectiveIgnition, gpsTs.getTime());
+    runningHrs  = _updateRunningHours(dev.imei, effectiveIgnition, dev.speed, gpsTs.getTime());
+    
+    // Calculate delta segment driven in this tick
+    if (dailyRec && dailyRec.lastLat != null && dev.speed > 1 && effectiveIgnition) {
+      const raw = haversineKm(dailyRec.lastLat, dailyRec.lastLng, lat, lng);
+      if (!isNoisePoint(raw)) delta = raw;
+    }
   } else if (hasValidGPS) {
     // Duplicate — return current accumulator without incrementing
     const dailyRec = _dailyDist.get(dev.imei);
     const engRec   = _engineHours.get(dev.imei);
+    const runRec   = _runningHours.get(dev.imei);
     todayDistKm = dailyRec?.distKm   ?? 0;
     engineHrs   = engRec?.hoursToday ?? 0;
+    runningHrs  = runRec?.hoursToday  ?? 0;
+  }
+
+  // 7b. Update max speed in memory
+  const maxSpeedRec = _todayMaxSpeed.get(dev.imei);
+  let currentMaxSpeed = 0;
+  if (!maxSpeedRec || maxSpeedRec.dateStr !== today) {
+    currentMaxSpeed = dev.speed;
+    _todayMaxSpeed.set(dev.imei, { maxSpeed: currentMaxSpeed, dateStr: today });
+  } else {
+    currentMaxSpeed = Math.max(maxSpeedRec.maxSpeed, dev.speed);
+    _todayMaxSpeed.set(dev.imei, { maxSpeed: currentMaxSpeed, dateStr: today });
+  }
+
+  // 7c. Update stops in memory
+  let currentStops = 0;
+  if (hasValidGPS && !isDuplicate) {
+    const stopsRec = _todayStops.get(dev.imei);
+    if (!stopsRec || stopsRec.dateStr !== today) {
+      currentStops = (vehicle.status === 'moving' && status !== 'moving') ? 1 : 0;
+      _todayStops.set(dev.imei, { stops: currentStops, dateStr: today });
+    } else {
+      currentStops = stopsRec.stops;
+      if (vehicle.status === 'moving' && status !== 'moving') {
+        currentStops += 1;
+      }
+      _todayStops.set(dev.imei, { stops: currentStops, dateStr: today });
+    }
+  } else {
+    currentStops = _todayStops.get(dev.imei)?.stops ?? vehicle.todayStops ?? 0;
   }
 
   // 8a. Store RawGpsLog (unconditional — source of truth)
@@ -796,6 +916,9 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     status,
     todayDistance:    todayDistKm,       // ← always written
     todayEngineHours: engineHrs,         // ← always written
+    todayRunningHours: runningHrs,       // ← always written
+    todayMaxSpeed:    currentMaxSpeed,   // ← always written
+    todayStops:       currentStops,      // ← always written
     satellites:       dev.satellites,
     accuracy:         dev.accuracy,
   };
@@ -844,21 +967,13 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       $set: vehicleUpdate,
     };
 
-    if (isNewDay) {
-      vehicleUpdate.todayMaxSpeed = dev.speed;
-      vehicleUpdate.todayStops = (vehicle.status === 'moving' && status !== 'moving') ? 1 : 0;
-    } else {
-      updateOp.$max = { todayMaxSpeed: dev.speed };
-      // Increment today's stops count if vehicle transitions out of moving state
-      if (vehicle.status === 'moving' && status !== 'moving') {
-        updateOp.$inc = { todayStops: 1 };
-      }
-    }
-
     // FIX-ODO: only overwrite odometer if device sends a valid, larger value
     if (dev.odometer != null && dev.odometer > 0) {
       if (!updateOp.$max) updateOp.$max = {};
       updateOp.$max.odometer = dev.odometer;
+    } else if (delta > 0) {
+      updateOp.$inc = updateOp.$inc || {};
+      updateOp.$inc.odometer = delta;
     }
 
     await Vehicle.findByIdAndUpdate(vehicleId, updateOp);
@@ -934,7 +1049,13 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       todayEngineHours: engineHrs,
       engineHours:    engineHrs,
 
-      todayMaxSpeed:  isNewDay ? dev.speed : Math.max(vehicle.todayMaxSpeed ?? 0, dev.speed),
+      // Running hours aliases
+      todayRunningHours: runningHrs,
+      runningHoursToday: runningHrs,
+      runningHours:      runningHrs,
+
+      todayMaxSpeed:  currentMaxSpeed,
+      todayStops:     currentStops,
 
       // Odometer — Flutter reads: mileage, odometer, totalDistance, totalKm
       odometer:      dev.odometer ?? vehicle.odometer ?? 0,

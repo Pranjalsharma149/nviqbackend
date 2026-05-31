@@ -131,8 +131,16 @@ function buildSocketPayload(v) {
     todayEngineHours: v.todayEngineHours ?? 0,
     engineHours: v.todayEngineHours ?? 0,
 
+    // Running hours aliases
+    todayRunningHours: v.todayRunningHours ?? 0,
+    runningHoursToday: v.todayRunningHours ?? 0,
+    runningHours: v.todayRunningHours ?? 0,
+
     // Today max speed
     todayMaxSpeed: v.todayMaxSpeed ?? 0,
+
+    // Today stops count
+    todayStops: v.todayStops ?? 0,
 
     // Address
     address: v.address ?? v.lastKnownLocation?.address ?? '',
@@ -154,7 +162,7 @@ exports.getLiveVehicles = async (req, res) => {
         'latitude', 'longitude', 'speed', 'heading', 'status',
         'isOnline', 'isLive', 'ignitionOn', 'ignitionSince', 'statusSince', 'batteryVoltage', 'satellites', 'accuracy',
         'address', 'lastUpdate', 'lastOnlineAt', 'lastKnownLocation',
-        'todayDistance', 'todayEngineHours', 'todayMaxSpeed', 'todayStops',
+        'todayDistance', 'todayEngineHours', 'todayRunningHours', 'todayMaxSpeed', 'todayStops',
         'odometer', 'pocName', 'pocContact', 'speedLimit', 'analytics',
       ].join(' '))
       .limit(2000)
@@ -273,6 +281,9 @@ exports.getLiveVehicles = async (req, res) => {
         // Flutter FIX-2: engine hours
         engineHoursToday: v.todayEngineHours ?? 0,
         todayEngineHours: v.todayEngineHours ?? 0,
+        todayRunningHours: v.todayRunningHours ?? 0,
+        runningHoursToday: v.todayRunningHours ?? 0,
+        runningHours: v.todayRunningHours ?? 0,
         todayMaxSpeed: v.todayMaxSpeed ?? 0,
 
         pocName: v.pocName ?? '',

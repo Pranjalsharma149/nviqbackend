@@ -96,6 +96,7 @@ async function computeDailyFromRaw(vehicleId, from, to) {
       idleHours: 0,
       maxSpeed: 0,
       avgSpeed: 0,
+      todayStops: 0,
       rawPointCount: 0,
     };
   }
@@ -136,6 +137,39 @@ async function computeDailyFromRaw(vehicleId, from, to) {
 
   const avgSpeed = speedCount > 0 ? speedSum / speedCount : 0;
 
+  // ── Stops ──────────────────────────────────────────────────────────────────
+  let stopsCount = 0;
+  let stopStart = null;
+  const MIN_STOP_DURATION_SEC = 120; // 2 minutes
+
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const speed = p.speed || 0;
+    const isStopped = speed <= 5;
+
+    if (isStopped) {
+      if (stopStart === null) {
+        stopStart = p.gpsTimestamp;
+      }
+    } else {
+      if (stopStart !== null) {
+        const durationSec = Math.round((p.gpsTimestamp - stopStart) / 1000);
+        if (durationSec >= MIN_STOP_DURATION_SEC) {
+          stopsCount++;
+        }
+        stopStart = null;
+      }
+    }
+  }
+
+  if (stopStart !== null && points.length > 0) {
+    const lastPoint = points[points.length - 1];
+    const durationSec = Math.round((lastPoint.gpsTimestamp - stopStart) / 1000);
+    if (durationSec >= MIN_STOP_DURATION_SEC) {
+      stopsCount++;
+    }
+  }
+
   return {
     totalDistance: parseFloat(totalDistance.toFixed(3)),
     engineOnSeconds: Math.round(engineOnSeconds),
@@ -146,6 +180,7 @@ async function computeDailyFromRaw(vehicleId, from, to) {
     idleHours: parseFloat((idleSeconds / 3600).toFixed(2)),
     maxSpeed: parseFloat(maxSpeed.toFixed(1)),
     avgSpeed: parseFloat(avgSpeed.toFixed(1)),
+    todayStops: stopsCount,
     rawPointCount: points.length,
   };
 }

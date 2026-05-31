@@ -298,6 +298,12 @@ const vehicleSchema = new mongoose.Schema(
       comment: 'Today engine hours',
     },
 
+    todayRunningHours: {
+      type: Number,
+      default: 0,
+      comment: 'Today running hours (engine on and moving)',
+    },
+
     todayMaxSpeed: {
       type: Number,
       default: 0,
