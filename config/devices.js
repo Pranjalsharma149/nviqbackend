@@ -16,55 +16,55 @@ const REGISTERED_DEVICES = [
 
   // ── IOP GPS Platform Devices (WanWay) ──────────────────────────────────────
   {
-    imei:         '356218606576971',
-    vehicleReg:   'HR26AB1234',
-    name:         'Vehicle Tracker 1',
-    type:         'car',
-    protocol:     'PT06',              // Via IOP GPS platform
-    pocName:      'John Doe',
-    pocContact:   '+919999999999',
-    speedLimit:   80,
-    fuelAlert:    15,
-    battAlert:    20,
+    imei: '356218606576971',
+    vehicleReg: 'HR26AB1234',
+    name: 'RJ02CF3703',
+    type: 'car',
+    protocol: 'PT06',              // Via IOP GPS platform
+    pocName: 'John Doe',
+    pocContact: '+919999999999',
+    speedLimit: 80,
+    fuelAlert: 15,
+    battAlert: 20,
   },
   {
-    imei:         '868720064616620',
-    vehicleReg:   'DEVICE2',
-    name:         'Vehicle Tracker 2',
-    type:         'car',
-    protocol:     'PT06',              // Via IOP GPS platform
-    pocName:      '',
-    pocContact:   '',
-    speedLimit:   80,
-    fuelAlert:    15,
-    battAlert:    20,
-    sim:          '89911025034030798906',
+    imei: '868720064616620',
+    vehicleReg: 'DEVICE2',
+    name: 'Vehicle Tracker 2',
+    type: 'car',
+    protocol: 'PT06',              // Via IOP GPS platform
+    pocName: '',
+    pocContact: '',
+    speedLimit: 80,
+    fuelAlert: 15,
+    battAlert: 20,
+    sim: '89911025034030798906',
   },
 
   // ── Direct TCP Devices (GT06 protocol → port 5001) ─────────────────────────
   {
-    imei:         '866221070653410',
-    vehicleReg:   'DEVICE3',
-    name:         'Vehicle Tracker 3',
-    type:         'car',
-    protocol:     'GT06',              // Direct TCP — PRIME09
-    pocName:      '',
-    pocContact:   '',
-    speedLimit:   80,
-    fuelAlert:    15,
-    battAlert:    20,
+    imei: '866221070653410',
+    vehicleReg: 'DEVICE3',
+    name: 'Vehicle Tracker 3',
+    type: 'car',
+    protocol: 'GT06',              // Direct TCP — PRIME09
+    pocName: '',
+    pocContact: '',
+    speedLimit: 80,
+    fuelAlert: 15,
+    battAlert: 20,
   },
   {
-    imei:         '867010072155188',
-    vehicleReg:   'DEVICE4',
-    name:         'Vehicle Tracker 4',
-    type:         'car',
-    protocol:     'GT06',              // Direct TCP — VL149
-    pocName:      '',
-    pocContact:   '',
-    speedLimit:   80,
-    fuelAlert:    15,
-    battAlert:    20,
+    imei: '867010072155188',
+    vehicleReg: 'DEVICE4',
+    name: 'Vehicle Tracker 4',
+    type: 'car',
+    protocol: 'GT06',              // Direct TCP — VL149
+    pocName: '',
+    pocContact: '',
+    speedLimit: 80,
+    fuelAlert: 15,
+    battAlert: 20,
   },
 
   // ── MultiTrackVTS Platform Devices (AIS 140 VLTD) ──────────────────────────
@@ -72,25 +72,25 @@ const REGISTERED_DEVICES = [
     // ✅ CORRECT: Using the ACTUAL vehicleNumber from MultiTrackVTS dashboard
     // Dashboard shows: K15CN9457322 (this is YOUR vehicle in Vapi)
     // Wrong API was returning: MA3SFM61STA461818 (a different vehicle in Gandhinagar)
-    imei:         'K15CN9457322',       // ✅ Engine No. = Correct vehicleNumber in MultiTrack API
-    vehicleReg:   'GJ15AX0695',         // ← Vehicle Registration Number
-    name:         'HANSABEN C PATEL - Tour M CNG',
-    type:         'car',
-    protocol:     'MULTITRACK',         // Via MultiTrackVTS platform
-    pocName:      'HANSABEN C PATEL',
-    pocContact:   '+919904146665',
-    speedLimit:   80,
-    fuelAlert:    15,
-    battAlert:    20,
+    imei: 'K15CN9457322',       // ✅ Engine No. = Correct vehicleNumber in MultiTrack API
+    vehicleReg: 'GJ15AX0695',         // ← Vehicle Registration Number
+    name: 'HANSABEN C PATEL - Tour M CNG',
+    type: 'car',
+    protocol: 'MULTITRACK',         // Via MultiTrackVTS platform
+    pocName: 'HANSABEN C PATEL',
+    pocContact: '+919904146665',
+    speedLimit: 80,
+    fuelAlert: 15,
+    battAlert: 20,
 
     // AIS 140 / VLTD Device Information (from fitment certificate & MultiTrack dashboard)
-    maker:        'MARUTI SUZUKI INDIA LTD',
-    model:        'TOUR M (O) CNG',
-    chassisNo:    'MA3BNC62SRC767065',  // Chassis number from RTO certificate
-    deviceImei:   '860187062376870',    // GPS Device IMEI
-    engineNo:     'K15CN9457322',       // Engine number = vehicleNumber in MultiTrack
-    fitmentDate:  '2024-03-29',         // Manufacturing date
-    rtoCodes:     'GJ15',               // Vapi RTO code
+    maker: 'MARUTI SUZUKI INDIA LTD',
+    model: 'TOUR M (O) CNG',
+    chassisNo: 'MA3BNC62SRC767065',  // Chassis number from RTO certificate
+    deviceImei: '860187062376870',    // GPS Device IMEI
+    engineNo: 'K15CN9457322',       // Engine number = vehicleNumber in MultiTrack
+    fitmentDate: '2024-03-29',         // Manufacturing date
+    rtoCodes: 'GJ15',               // Vapi RTO code
     manufacturingYear: 2024,
   },
 
@@ -98,20 +98,20 @@ const REGISTERED_DEVICES = [
 
 // ── OPTIMIZED LOOKUPS ─────────────────────────────────────────────────────────
 const BY_IMEI = new Map();
-const BY_REG  = new Map();
+const BY_REG = new Map();
 
 REGISTERED_DEVICES.forEach(device => {
-  if (device.imei)       BY_IMEI.set(String(device.imei), device);
+  if (device.imei) BY_IMEI.set(String(device.imei), device);
   if (device.vehicleReg) BY_REG.set(String(device.vehicleReg), device);
 });
 
 module.exports = {
   REGISTERED_DEVICES,
 
-  getByIMEI:     (imei) => BY_IMEI.get(String(imei)) || null,
-  getByReg:      (reg)  => BY_REG.get(String(reg))   || null,
+  getByIMEI: (imei) => BY_IMEI.get(String(imei)) || null,
+  getByReg: (reg) => BY_REG.get(String(reg)) || null,
   isKnownDevice: (imei) => BY_IMEI.has(String(imei)),
-  getAllIMEIs:    ()     => Array.from(BY_IMEI.keys()),
+  getAllIMEIs: () => Array.from(BY_IMEI.keys()),
 
   // Returns only IMEIs that use the IOP GPS platform (polled via WanWay)
   getIopIMEIs: () => REGISTERED_DEVICES
