@@ -168,21 +168,21 @@ async function backfill(days = 30) {
 }
 
 
-// ── resetTodayStops ───────────────────────────────────────────────────────────
-async function resetTodayStops() {
+// ── resetTodayIdleTime ────────────────────────────────────────────────────────
+async function resetTodayIdleTime() {
   try {
     const result = await Vehicle.updateMany(
       {},
       {
         $set: {
-          todayStops: 0,
-          todayStopResetAt: new Date(),
+          todayIdleTime: 0,
+          todayIdleResetAt: new Date(),
         },
       }
     );
-    logger.info('🔄 [DailySummaryJob] todayStops reset for %d vehicles', result.modifiedCount);
+    logger.info('🔄 [DailySummaryJob] todayIdleTime reset for %d vehicles', result.modifiedCount);
   } catch (err) {
-    logger.error('❌ [DailySummaryJob] todayStops reset failed: %s', err.message);
+    logger.error('❌ [DailySummaryJob] todayIdleTime reset failed: %s', err.message);
   }
 }
 
@@ -228,7 +228,7 @@ function start() {
     logger.info('⏰ [DailySummaryJob] Cron triggered');
     try {
       await runYesterday();
-      await resetTodayStops(); // for reset daily stops basically it is there only temp for day only
+      await resetTodayIdleTime(); // reset daily idle hours
       await archiveOldRawLogs();
     } catch (err) {
       logger.error('❌ [DailySummaryJob] Cron run failed: %s', err.message);

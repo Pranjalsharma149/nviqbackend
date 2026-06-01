@@ -38,9 +38,9 @@ const tripItemSchema = new mongoose.Schema({
     type: String, // formatted string, e.g. '45 km/h'
     default: '0'
   },
-  stops: {
-    type: Number,
-    default: 0
+  idle_time: {
+    type: String,
+    default: '0 mins'
   },
   latlong: {
     lat: { type: String, default: '0.0' },
@@ -76,8 +76,8 @@ const historySchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
-  totalstops: {
-    type: Number,
+  todayIdleTime: {
+    type: Number, // Stored as numeric (seconds) for aggregation
     default: 0
   },
   trips: [tripItemSchema]

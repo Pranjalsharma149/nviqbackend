@@ -139,8 +139,15 @@ function buildSocketPayload(v) {
     // Today max speed
     todayMaxSpeed: v.todayMaxSpeed ?? 0,
 
-    // Today stops count
-    todayStops: v.todayStops ?? 0,
+    // Today idle time
+    todayIdleTime: (() => {
+      const totalSeconds = Math.round((v.todayIdleTime ?? 0) * 3600);
+      const idleH = Math.floor(totalSeconds / 3600);
+      const idleM = Math.floor((totalSeconds % 3600) / 60);
+      const idleS = Math.round(totalSeconds % 60);
+      return `${idleH}h ${idleM}m ${idleS}s`;
+    })(),
+    idleHours: v.todayIdleTime ?? 0,
 
     // Address
     address: v.address ?? v.lastKnownLocation?.address ?? '',
@@ -188,7 +195,7 @@ exports.getLiveVehicles = async (req, res) => {
         'latitude', 'longitude', 'speed', 'heading', 'status',
         'isOnline', 'isLive', 'ignitionOn', 'ignitionSince', 'statusSince', 'batteryVoltage', 'satellites', 'accuracy',
         'address', 'lastUpdate', 'lastOnlineAt', 'lastKnownLocation',
-        'todayDistance', 'todayEngineHours', 'todayRunningHours', 'todayMaxSpeed', 'todayStops',
+        'todayDistance', 'todayEngineHours', 'todayRunningHours', 'todayMaxSpeed', 'todayIdleTime',
         'odometer', 'pocName', 'pocContact', 'speedLimit', 'analytics',
       ].join(' '))
       .limit(2000)
@@ -204,13 +211,14 @@ exports.getLiveVehicles = async (req, res) => {
     const istStart = new Date(Date.UTC(yr, mo - 1, dy - 1, 18, 30, 0, 0));
     const istEnd = new Date(Date.UTC(yr, mo - 1, dy, 18, 29, 59, 999));
 
-    // 1. Calculate stops for today for all vehicles from RawGpsLog (using moving -> stopped transition)
+    // 1. Calculate idle time for today for all vehicles from RawGpsLog
     const RawGpsLog = require('../models/RawGpsLog');
     const allPoints = await RawGpsLog.find({
-      gpsTimestamp: { $gte: istStart, $lte: istEnd }
+      gpsTimestamp: { $gte: istStart, $lte: istEnd },
+      isDuplicate: false
     })
       .sort({ gpsTimestamp: 1 })
-      .select('vehicleId speed')
+      .select('vehicleId speed ignition gpsTimestamp')
       .lean();
 
     const pointsByVehicle = {};
@@ -223,21 +231,25 @@ exports.getLiveVehicles = async (req, res) => {
       pointsByVehicle[vidStr].push(p);
     }
 
-    const stopsMap = {};
+    const idleMap = {};
     for (const vidStr in pointsByVehicle) {
       const points = pointsByVehicle[vidStr];
-      let stopsCount = 0;
-      let wasMoving = false;
-      for (let i = 0; i < points.length; i++) {
-        const p = points[i];
-        const speed = p.speed || 0;
-        const isMoving = speed > 5;
-        if (wasMoving && !isMoving) {
-          stopsCount++;
+      let idleSeconds = 0;
+      for (let i = 1; i < points.length; i++) {
+        const prev = points[i - 1];
+        const curr = points[i];
+
+        const segSec = Math.min(
+          Math.max((curr.gpsTimestamp - prev.gpsTimestamp) / 1000, 0),
+          600
+        );
+
+        const ignOn = curr.ignition === true || prev.ignition === true || curr.speed > 0;
+        if (ignOn && curr.speed <= 5) {
+          idleSeconds += segSec;
         }
-        wasMoving = isMoving;
       }
-      stopsMap[vidStr] = stopsCount;
+      idleMap[vidStr] = idleSeconds;
     }
 
     // 2. Fetch today's trips for all vehicles from Trip to calculate running time
@@ -296,7 +308,12 @@ exports.getLiveVehicles = async (req, res) => {
     const data = vehicles.map(v => {
       const lkl = v.lastKnownLocation;
       const vidStr = v._id.toString();
-      const correctStops = stopsMap[vidStr] ?? 0;
+      const correctIdleSeconds = idleMap[vidStr] ?? 0;
+      const idleH = Math.floor(correctIdleSeconds / 3600);
+      const idleM = Math.floor((correctIdleSeconds % 3600) / 60);
+      const idleS = Math.round(correctIdleSeconds % 60);
+      const idle_time = `${idleH}h ${idleM}m ${idleS}s`;
+      const correctIdleHours = correctIdleSeconds / 3600;
 
       // Calculate running time (same logic as history API)
       let runningTimeMins = Math.round(runningTimeMap[vidStr] ?? 0);
@@ -310,13 +327,13 @@ exports.getLiveVehicles = async (req, res) => {
       const running_time = `${runH}h ${runM}m`;
 
       // Self-heal the database values if they are out of sync
-      const needsUpdate = (v.todayStops !== correctStops) || (Math.abs((v.todayRunningHours ?? 0) - runningHours) > 0.01);
+      const needsUpdate = (Math.abs((v.todayIdleTime ?? 0) - correctIdleHours) > 0.01) || (Math.abs((v.todayRunningHours ?? 0) - runningHours) > 0.01);
       if (needsUpdate) {
         Vehicle.updateOne(
           { _id: v._id },
           {
             $set: {
-              todayStops: correctStops,
+              todayIdleTime: correctIdleHours,
               todayRunningHours: runningHours
             }
           }
@@ -379,8 +396,10 @@ exports.getLiveVehicles = async (req, res) => {
         heading: v.heading ?? 0,
         status: v.status ?? 'offline',
 
-        // today stops
-        todayStops: correctStops,
+        // today idle time
+        todayIdleTime: idle_time,
+        idleTime: idle_time,
+        idleHours: correctIdleHours,
 
         // Flutter FIX-3: ignition
         ignition: v.ignitionOn ?? false,
@@ -521,8 +540,8 @@ exports.batchUpdate = async (req, res) => {
         lastUpdate: u.timestamp ? new Date(u.timestamp) : now,
       };
 
-      if (u.todayStops !== undefined) {
-        baseSet.todayStops = u.todayStops;
+      if (u.todayIdleTime !== undefined) {
+        baseSet.todayIdleTime = u.todayIdleTime;
       }
 
       if (hasValidGPS) {

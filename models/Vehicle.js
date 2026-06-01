@@ -130,11 +130,12 @@ const vehicleSchema = new mongoose.Schema(
       comment: 'GPS device status',
     },
 
-    todayStops: {
+    todayIdleTime: {
       type: Number,
-      default: 0
+      default: 0,
+      comment: 'Today idle time in hours'
     },
-    todayStopResetAt: {
+    todayIdleResetAt: {
       type: Date,
       default: null
     },

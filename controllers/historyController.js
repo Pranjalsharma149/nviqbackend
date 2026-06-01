@@ -174,23 +174,29 @@ async function generateHistoryDoc(vehicleId, imei, dateInput) {
       ? await resolveAddressForTime(vehicleId, t.endTime || new Date(), t.endLocation)
       : 'Active Now';
 
-    // Count stops during this trip window
+    // Calculate idle time during this trip window
     const pings = await LocationPing.find({
       vehicleId: vehicleId.toString(),
       gpsTime: { $gte: t.startTime, $lte: t.endTime || new Date() }
-    }).sort({ gpsTime: 1 }).select('speed').lean();
+    }).sort({ gpsTime: 1 }).select('gpsTime speed').lean();
 
-    let stops = 0;
-    let isStoppedState = false;
-    for (const p of pings) {
-      const isStopped = (p.speed || 0) <= 5;
-      if (isStopped && !isStoppedState) {
-        stops++;
-        isStoppedState = true;
-      } else if (!isStopped) {
-        isStoppedState = false;
+    let idleSeconds = 0;
+    for (let i = 1; i < pings.length; i++) {
+      const prev = pings[i - 1];
+      const curr = pings[i];
+      const isStopped = (curr.speed || 0) <= 5 && (prev.speed || 0) <= 5;
+      if (isStopped) {
+        const segSec = Math.min(
+          Math.max((curr.gpsTime - prev.gpsTime) / 1000, 0),
+          600
+        );
+        idleSeconds += segSec;
       }
     }
+    const idleH = Math.floor(idleSeconds / 3600);
+    const idleM = Math.floor((idleSeconds % 3600) / 60);
+    const idleS = Math.round(idleSeconds % 60);
+    const formattedIdleTime = `${idleH}h ${idleM}m ${idleS}s`;
 
     return {
       date: formatToIstDate(t.startTime),
@@ -202,7 +208,7 @@ async function generateHistoryDoc(vehicleId, imei, dateInput) {
       distance: `${distKm.toFixed(2)} km`,
       max_speed: `${maxSp.toFixed(1)} km/h`,
       avg_speed: `${avgSp.toFixed(1)} km/h`,
-      stops,
+      idle_time: formattedIdleTime,
       latlong: {
         lat: t.startLocation?.latitude?.toString() || '0.0',
         long: t.startLocation?.longitude?.toString() || '0.0'
@@ -217,7 +223,7 @@ async function generateHistoryDoc(vehicleId, imei, dateInput) {
     distance: stats.totalDistance,
     running_time: runningTimeMins,
     max_speed: stats.maxSpeed,
-    totalstops: stats.todayStops,
+    todayIdleTime: Math.round(stats.idleSeconds),
     trips: formattedTrips
   };
 }
@@ -324,7 +330,7 @@ function aggregateHistory(historyRecords) {
   let distance = 0;
   let running_time = 0;
   let max_speed = 0;
-  let totalstops = 0;
+  let todayIdleTime = 0;
   let trips = [];
 
   for (const record of historyRecords) {
@@ -333,17 +339,21 @@ function aggregateHistory(historyRecords) {
     if ((record.max_speed || 0) > max_speed) {
       max_speed = record.max_speed;
     }
-    totalstops += record.totalstops || 0;
+    todayIdleTime += record.todayIdleTime || 0;
     if (record.trips && Array.isArray(record.trips)) {
       trips = trips.concat(record.trips);
     }
   }
 
+  const idleH = Math.floor(todayIdleTime / 3600);
+  const idleM = Math.floor((todayIdleTime % 3600) / 60);
+  const idleS = Math.round(todayIdleTime % 60);
+
   return {
     distance: `${distance.toFixed(2)} km`,
     running_time: `${Math.floor(running_time / 60)}h ${Math.round(running_time % 60)}m`,
     max_speed: `${max_speed.toFixed(1)} km/h`,
-    totalstops,
+    todayIdleTime: `${idleH}h ${idleM}m ${idleS}s`,
     trips
   };
 }
@@ -421,7 +431,7 @@ exports.getAllVehiclesHistory = async (req, res) => {
         success: true,
         scope: req.user.role === 'admin' ? 'all_nviq_admin' : 'my_fleet',
         dateRange: { start: startStr, end: endStr },
-        data: { distance: '0.00 km', running_time: '0h 0m', max_speed: '0.0 km/h', totalstops: 0, trips: [] }
+        data: { distance: '0.00 km', running_time: '0h 0m', max_speed: '0.0 km/h', todayIdleTime: '0h 0m 0s', trips: [] }
       });
     }
 

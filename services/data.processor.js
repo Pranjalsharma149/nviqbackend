@@ -339,10 +339,36 @@ function _updateRunningHours(imei, ignitionOn, speed, pointTs) {
   return newHours;
 }
 
+// ── Idle hours accumulator ────────────────────────────────────────────────────
+const _todayIdleTime = new Map();
+
+function _updateIdleHours(imei, ignitionOn, speed, pointTs) {
+  const today = _getTodayStr();
+  const prev = _todayIdleTime.get(imei);
+
+  if (!prev || prev.dateStr !== today) {
+    _todayIdleTime.set(imei, { hoursToday: 0, lastTs: pointTs, dateStr: today });
+    return 0;
+  }
+
+  let addedHours = 0;
+  // Idle condition: ignition ON (or inferred ON) and speed <= 5 km/h
+  const isMoving = speed > 5;
+  if (ignitionOn && !isMoving && prev.lastTs) {
+    const elapsedMs = pointTs - prev.lastTs;
+    if (elapsedMs > 0 && elapsedMs < 60 * 60 * 1000) {
+      addedHours = elapsedMs / (1000 * 3600);
+    }
+  }
+
+  const newHours = prev.hoursToday + addedHours;
+  _todayIdleTime.set(imei, { hoursToday: newHours, lastTs: pointTs, dateStr: today });
+  return newHours;
+}
+
 // ── Daily accumulator pruning ─────────────────────────────────────────────────
 const _tripState = new Map();
 const _todayMaxSpeed = new Map();
-const _todayStops = new Map();
 
 setInterval(() => {
   const today = _getTodayStr();
@@ -358,8 +384,8 @@ setInterval(() => {
   for (const [imei, rec] of _todayMaxSpeed.entries()) {
     if (rec.dateStr !== today) _todayMaxSpeed.delete(imei);
   }
-  for (const [imei, rec] of _todayStops.entries()) {
-    if (rec.dateStr !== today) _todayStops.delete(imei);
+  for (const [imei, rec] of _todayIdleTime.entries()) {
+    if (rec.dateStr !== today) _todayIdleTime.delete(imei);
   }
   for (const [imei, state] of _tripState.entries()) {
     if (!state.tripId) _tripState.delete(imei);
@@ -632,7 +658,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   const today = _getTodayStr();
 
   // Seed daily metrics from RawGpsLog (self-healing) if not in memory
-  if (!_dailyDist.has(dev.imei) || !_engineHours.has(dev.imei) || !_runningHours.has(dev.imei) || !_todayMaxSpeed.has(dev.imei) || !_todayStops.has(dev.imei)) {
+  if (!_dailyDist.has(dev.imei) || !_engineHours.has(dev.imei) || !_runningHours.has(dev.imei) || !_todayMaxSpeed.has(dev.imei) || !_todayIdleTime.has(dev.imei)) {
     try {
       const todayStart = utcDayStart(now);
       const todayEnd = utcDayEnd(now);
@@ -663,8 +689,9 @@ async function processIncomingData(rawDevice, source = 'wanway') {
         dateStr: today,
       });
 
-      _todayStops.set(dev.imei, {
-        stops: stats.todayStops ?? 0,
+      _todayIdleTime.set(dev.imei, {
+        hoursToday: stats.idleHours ?? 0,
+        lastTs: gpsTs.getTime(),
         dateStr: today,
       });
 
@@ -673,7 +700,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       vehicle.todayEngineHours = stats.engineHours ?? 0;
       vehicle.todayRunningHours = stats.runningHours ?? 0;
       vehicle.todayMaxSpeed = stats.maxSpeed ?? 0;
-      vehicle.todayStops = stats.todayStops ?? 0;
+      vehicle.todayIdleTime = stats.idleHours ?? 0;
 
     } catch (err) {
       logger.error('❌ [Processor] Failed to self-heal metrics for IMEI=%s: %s', dev.imei, err.message);
@@ -708,9 +735,10 @@ async function processIncomingData(rawDevice, source = 'wanway') {
           dateStr: today,
         });
       }
-      if (!_todayStops.has(dev.imei)) {
-        _todayStops.set(dev.imei, {
-          stops: vehicle.todayStops ?? 0,
+      if (!_todayIdleTime.has(dev.imei)) {
+        _todayIdleTime.set(dev.imei, {
+          hoursToday: vehicle.todayIdleTime ?? 0,
+          lastTs: vehicle.lastUpdate ? new Date(vehicle.lastUpdate).getTime() : null,
           dateStr: today,
         });
       }
@@ -788,22 +816,12 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     _todayMaxSpeed.set(dev.imei, { maxSpeed: currentMaxSpeed, dateStr: today });
   }
 
-  // 7c. Update stops in memory
-  let currentStops = 0;
+  // 7c. Update idle hours in memory
+  let currentIdleTime = 0;
   if (hasValidGPS && !isDuplicate) {
-    const stopsRec = _todayStops.get(dev.imei);
-    if (!stopsRec || stopsRec.dateStr !== today) {
-      currentStops = (vehicle.status === 'moving' && status !== 'moving') ? 1 : 0;
-      _todayStops.set(dev.imei, { stops: currentStops, dateStr: today });
-    } else {
-      currentStops = stopsRec.stops;
-      if (vehicle.status === 'moving' && status !== 'moving') {
-        currentStops += 1;
-      }
-      _todayStops.set(dev.imei, { stops: currentStops, dateStr: today });
-    }
+    currentIdleTime = _updateIdleHours(dev.imei, effectiveIgnition, dev.speed, gpsTs.getTime());
   } else {
-    currentStops = _todayStops.get(dev.imei)?.stops ?? vehicle.todayStops ?? 0;
+    currentIdleTime = _todayIdleTime.get(dev.imei)?.hoursToday ?? vehicle.todayIdleTime ?? 0;
   }
 
   // 8a. Store RawGpsLog (unconditional — source of truth)
@@ -912,7 +930,7 @@ async function processIncomingData(rawDevice, source = 'wanway') {
     todayEngineHours: engineHrs,         // ← always written
     todayRunningHours: runningHrs,       // ← always written
     todayMaxSpeed: currentMaxSpeed,   // ← always written
-    todayStops: currentStops,      // ← always written
+    todayIdleTime: currentIdleTime,   // ← always written
     satellites: dev.satellites,
     accuracy: dev.accuracy,
   };
@@ -1049,7 +1067,8 @@ async function processIncomingData(rawDevice, source = 'wanway') {
       runningHours: runningHrs,
 
       todayMaxSpeed: currentMaxSpeed,
-      todayStops: currentStops,
+      todayIdleTime: `${Math.floor(currentIdleTime)}h ${Math.round((currentIdleTime % 1) * 60)}m`,
+      idleHoursToday: currentIdleTime,
 
       // Odometer — Flutter reads: mileage, odometer, totalDistance, totalKm
       odometer: dev.odometer ?? vehicle.odometer ?? 0,
