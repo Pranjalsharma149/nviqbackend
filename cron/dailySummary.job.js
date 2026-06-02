@@ -168,21 +168,25 @@ async function backfill(days = 30) {
 }
 
 
-// ── resetTodayIdleTime ────────────────────────────────────────────────────────
-async function resetTodayIdleTime() {
+// ── resetTodayMetrics ────────────────────────────────────────────────────────
+async function resetTodayMetrics() {
   try {
     const result = await Vehicle.updateMany(
       {},
       {
         $set: {
           todayIdleTime: 0,
+          todayDistance: 0,
+          todayEngineHours: 0,
+          todayRunningHours: 0,
+          todayMaxSpeed: 0,
           todayIdleResetAt: new Date(),
         },
       }
     );
-    logger.info('🔄 [DailySummaryJob] todayIdleTime reset for %d vehicles', result.modifiedCount);
+    logger.info('🔄 [DailySummaryJob] Daily metrics reset for %d vehicles', result.modifiedCount);
   } catch (err) {
-    logger.error('❌ [DailySummaryJob] todayIdleTime reset failed: %s', err.message);
+    logger.error('❌ [DailySummaryJob] Daily metrics reset failed: %s', err.message);
   }
 }
 
@@ -228,7 +232,7 @@ function start() {
     logger.info('⏰ [DailySummaryJob] Cron triggered');
     try {
       await runYesterday();
-      await resetTodayIdleTime(); // reset daily idle hours
+      await resetTodayMetrics(); // reset daily metrics
       await archiveOldRawLogs();
     } catch (err) {
       logger.error('❌ [DailySummaryJob] Cron run failed: %s', err.message);

@@ -252,15 +252,30 @@ function _updateStatusSince(imei, currentStatus, ts) {
 const _dailyDist = new Map();
 
 function _getDateStr(date) {
+  if (!date) return '';
   const d = new Date(date);
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
+  const utc = d.getTime() + (d.getTimezoneOffset() * 60000);
+  const ist = new Date(utc + (3600000 * 5.5));
+  const year = ist.getFullYear();
+  const month = String(ist.getMonth() + 1).padStart(2, '0');
+  const day = String(ist.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
 function _getTodayStr() {
   return _getDateStr(new Date());
+}
+
+function getIstDayBoundaries(date) {
+  const d = new Date(date);
+  const utc = d.getTime() + (d.getTimezoneOffset() * 60000);
+  const ist = new Date(utc + (3600000 * 5.5));
+  const yr = ist.getFullYear();
+  const mo = ist.getMonth();
+  const dy = ist.getDate();
+  const istStart = new Date(Date.UTC(yr, mo, dy - 1, 18, 30, 0, 0));
+  const istEnd = new Date(Date.UTC(yr, mo, dy, 18, 29, 59, 999));
+  return { istStart, istEnd };
 }
 
 // FIX-IGN-3: ignitionOn now accepts the effective ignition (after inference)
@@ -660,9 +675,8 @@ async function processIncomingData(rawDevice, source = 'wanway') {
   // Seed daily metrics from RawGpsLog (self-healing) if not in memory
   if (!_dailyDist.has(dev.imei) || !_engineHours.has(dev.imei) || !_runningHours.has(dev.imei) || !_todayMaxSpeed.has(dev.imei) || !_todayIdleTime.has(dev.imei)) {
     try {
-      const todayStart = utcDayStart(now);
-      const todayEnd = utcDayEnd(now);
-      const stats = await computeDailyFromRaw(vehicleId, todayStart, todayEnd);
+      const { istStart, istEnd } = getIstDayBoundaries(now);
+      const stats = await computeDailyFromRaw(vehicleId, istStart, istEnd);
 
       _dailyDist.set(dev.imei, {
         distKm: stats.totalDistance ?? 0,

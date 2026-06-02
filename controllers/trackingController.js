@@ -313,28 +313,50 @@ exports.getLiveVehicles = async (req, res) => {
       const idleM = Math.floor((correctIdleSeconds % 3600) / 60);
       const idleS = Math.round(correctIdleSeconds % 60);
       const idle_time = `${idleH}h ${idleM}m ${idleS}s`;
-      const correctIdleHours = correctIdleSeconds / 3600;
+      
+      const hasUpdatesToday = v.lastUpdate && new Date(v.lastUpdate) >= istStart;
+
+      const currentDbIdle = v.todayIdleTime ?? 0;
+      const currentDbRunning = v.todayRunningHours ?? 0;
+      const currentDbDistance = v.todayDistance ?? 0;
+      const currentDbEngine = v.todayEngineHours ?? 0;
+      const currentDbMaxSpeed = v.todayMaxSpeed ?? 0;
+
+      const targetIdle = hasUpdatesToday ? (correctIdleSeconds / 3600) : 0;
 
       // Calculate running time (same logic as history API)
       let runningTimeMins = Math.round(runningTimeMap[vidStr] ?? 0);
-      if (runningTimeMins === 0 && v.todayRunningHours) {
+      if (runningTimeMins === 0 && hasUpdatesToday && v.todayRunningHours) {
         // Fallback to todayRunningHours in minutes if no trips recorded
         runningTimeMins = Math.round(v.todayRunningHours * 60);
       }
-      const runningHours = runningTimeMins / 60;
+      const targetRunning = runningTimeMins / 60;
       const runH = Math.floor(runningTimeMins / 60);
       const runM = Math.floor(runningTimeMins % 60);
       const running_time = `${runH}h ${runM}m`;
 
+      const targetDistance = hasUpdatesToday ? (v.todayDistance ?? 0) : 0;
+      const targetEngine = hasUpdatesToday ? (v.todayEngineHours ?? 0) : 0;
+      const targetMaxSpeed = hasUpdatesToday ? (v.todayMaxSpeed ?? 0) : 0;
+
       // Self-heal the database values if they are out of sync
-      const needsUpdate = (Math.abs((v.todayIdleTime ?? 0) - correctIdleHours) > 0.01) || (Math.abs((v.todayRunningHours ?? 0) - runningHours) > 0.01);
+      const needsUpdate = 
+        (Math.abs(currentDbIdle - targetIdle) > 0.01) || 
+        (Math.abs(currentDbRunning - targetRunning) > 0.01) ||
+        (Math.abs(currentDbDistance - targetDistance) > 0.001) ||
+        (Math.abs(currentDbEngine - targetEngine) > 0.01) ||
+        (Math.abs(currentDbMaxSpeed - targetMaxSpeed) > 0.1);
+
       if (needsUpdate) {
         Vehicle.updateOne(
           { _id: v._id },
           {
             $set: {
-              todayIdleTime: correctIdleHours,
-              todayRunningHours: runningHours
+              todayIdleTime: targetIdle,
+              todayRunningHours: targetRunning,
+              todayDistance: targetDistance,
+              todayEngineHours: targetEngine,
+              todayMaxSpeed: targetMaxSpeed
             }
           }
         ).catch(err =>
@@ -399,7 +421,7 @@ exports.getLiveVehicles = async (req, res) => {
         // today idle time
         todayIdleTime: idle_time,
         idleTime: idle_time,
-        idleHours: correctIdleHours,
+        idleHours: targetIdle,
 
         // Flutter FIX-3: ignition
         ignition: v.ignitionOn ?? false,
@@ -461,20 +483,20 @@ exports.getLiveVehicles = async (req, res) => {
         parkingSince: v.status !== 'moving' && v.statusSince ? new Date(v.statusSince).toISOString() : null,
 
         // Flutter FIX-1: today distance
-        todayDistanceKm: v.todayDistance ?? 0,
-        todayDistance: v.todayDistance ?? 0,
+        todayDistanceKm: targetDistance,
+        todayDistance: targetDistance,
         // Flutter FIX-4: odometer
-        totalDistanceKm: v.todayDistance ?? 0,
+        totalDistanceKm: targetDistance,
         odometer: v.odometer ?? 0,
         // Flutter FIX-2: engine hours
-        engineHoursToday: v.todayEngineHours ?? 0,
-        todayEngineHours: v.todayEngineHours ?? 0,
-        todayRunningHours: runningHours,
-        runningHoursToday: (runningHours),
-        runningHours: runningHours,
+        engineHoursToday: targetEngine,
+        todayEngineHours: targetEngine,
+        todayRunningHours: targetRunning,
+        runningHoursToday: (targetRunning),
+        runningHours: targetRunning,
         running_time,
         runningTime: running_time,
-        todayMaxSpeed: v.todayMaxSpeed ?? 0,
+        todayMaxSpeed: targetMaxSpeed,
 
         pocName: v.pocName ?? '',
         pocContact: v.pocContact ?? '',
