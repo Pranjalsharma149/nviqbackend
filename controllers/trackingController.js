@@ -218,7 +218,7 @@ exports.getLiveVehicles = async (req, res) => {
       isDuplicate: false
     })
       .sort({ gpsTimestamp: 1 })
-      .select('vehicleId speed ignition gpsTimestamp')
+      .select('vehicleId speed ignition gpsTimestamp latitude longitude')
       .lean();
 
     const pointsByVehicle = {};
@@ -232,9 +232,13 @@ exports.getLiveVehicles = async (req, res) => {
     }
 
     const idleMap = {};
+    const distanceMap = {};
+    const { haversineKm, isNoisePoint } = require('../utils/distance');
+
     for (const vidStr in pointsByVehicle) {
       const points = pointsByVehicle[vidStr];
       let idleSeconds = 0;
+      let totalDist = 0;
       for (let i = 1; i < points.length; i++) {
         const prev = points[i - 1];
         const curr = points[i];
@@ -248,8 +252,17 @@ exports.getLiveVehicles = async (req, res) => {
         if (ignOn && curr.speed <= 5) {
           idleSeconds += segSec;
         }
+
+        // Calculate distance matching same movement filter logic as processor:
+        if (ignOn && curr.speed > 1) {
+          const distKm = haversineKm(prev.latitude, prev.longitude, curr.latitude, curr.longitude);
+          if (!isNoisePoint(distKm)) {
+            totalDist += distKm;
+          }
+        }
       }
       idleMap[vidStr] = idleSeconds;
+      distanceMap[vidStr] = parseFloat(totalDist.toFixed(3));
     }
 
     // 2. Fetch today's trips for all vehicles from Trip to calculate running time
@@ -335,7 +348,10 @@ exports.getLiveVehicles = async (req, res) => {
       const runM = Math.floor(runningTimeMins % 60);
       const running_time = `${runH}h ${runM}m`;
 
-      const targetDistance = hasUpdatesToday ? (v.todayDistance ?? 0) : 0;
+      let targetDistance = hasUpdatesToday ? (distanceMap[vidStr] ?? 0) : 0;
+      if (targetDistance === 0 && hasUpdatesToday && v.todayDistance) {
+        targetDistance = v.todayDistance;
+      }
       const targetEngine = hasUpdatesToday ? (v.todayEngineHours ?? 0) : 0;
       const targetMaxSpeed = hasUpdatesToday ? (v.todayMaxSpeed ?? 0) : 0;
 

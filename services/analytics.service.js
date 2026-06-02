@@ -113,18 +113,20 @@ async function computeDailyFromRaw(vehicleId, from, to) {
     const prev = points[i - 1];
     const curr = points[i];
 
-    // ── Distance ──────────────────────────────────────────────────────────────
-    const distKm = haversineKm(prev.latitude, prev.longitude, curr.latitude, curr.longitude);
-    if (!isNoisePoint(distKm)) totalDistance += distKm;
+    // Ignition: treat as ON if either point reports it, or speed > 0
+    const ignOn = curr.ignition === true || prev.ignition === true || curr.speed > 0;
+
+    // ── Distance (Filtered by Ignition/Movement status to prevent Static Drift) ──
+    if (ignOn && curr.speed > 1) {
+      const distKm = haversineKm(prev.latitude, prev.longitude, curr.latitude, curr.longitude);
+      if (!isNoisePoint(distKm)) totalDistance += distKm;
+    }
 
     // ── Time segment (cap at 10 min to avoid inflating long gaps) ────────────
     const segSec = Math.min(
       Math.max((curr.gpsTimestamp - prev.gpsTimestamp) / 1000, 0),
       600
     );
-
-    // Ignition: treat as ON if either point reports it, or speed > 0
-    const ignOn = curr.ignition === true || prev.ignition === true || curr.speed > 0;
 
     if (ignOn) engineOnSeconds += segSec;
     if (curr.speed > 5) runningSeconds += segSec;
@@ -534,10 +536,31 @@ class AnalyticsService {
   // ── getLiveStats ────────────────────────────────────────────────────────────
   /** Current-day running stats — always live from RawGpsLog, never cached. */
   static async getLiveStats(vehicleId) {
-    return AnalyticsService.getDailyAnalytics(
-      vehicleId,
-      new Date().toISOString().split('T')[0]
-    );
+    const now = new Date();
+    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const ist = new Date(utc + (3600000 * 5.5));
+    const yr = ist.getFullYear();
+    const mo = ist.getMonth();
+    const dy = ist.getDate();
+    const istStart = new Date(Date.UTC(yr, mo, dy - 1, 18, 30, 0, 0));
+    const istEnd = new Date(Date.UTC(yr, mo, dy, 18, 29, 59, 999));
+
+    const vId = new mongoose.Types.ObjectId(vehicleId);
+    const stats = await computeDailyFromRaw(vId, istStart, istEnd);
+
+    const tripCount = await Trip.countDocuments({
+      vehicleId: vId,
+      isCompleted: true,
+      startTime: { $gte: istStart, $lte: istEnd },
+    });
+
+    return {
+      vehicleId: vehicleId.toString(),
+      date: ist.toISOString().split('T')[0],
+      tripCount,
+      fromCache: false,
+      ...stats,
+    };
   }
 }
 
